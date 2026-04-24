@@ -1,0 +1,16 @@
+## Interface: 20505, 30400, 110000, 110002, 110005, 110007, 120000
+## Title: EnemyList
+## Notes: List enemies in combat with you: distance, target, aggro. For click-casting on list rows or party frames, use Clique (or similar).
+## Author: EnemyList
+## Version: 1.8.96
+## SavedVariables: EnemyListAccountDB
+## SavedVariablesPerCharacter: EnemyListDB
+
+minimapicon.png
+Locales\enUS.lua
+Locales\init.lua
+EnemyListCore.lua
+EnemyListNameplateThreat.lua
+EnemyListUI.lua
+EnemyListMinimap.lua
+EnemyListSetupWizard.lua
