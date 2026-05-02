@@ -52,6 +52,12 @@ local defaults = {
   extendNameplateRange = true,
   --- Colored border on hostile nameplates from threat (tank lose-aggro pulse when |rawThreatPct| is available).
   nameplateThreatOverlay = false,
+  --- Mirror the enemy-list row (distance / threat / target) on the nameplate (above the bar).
+  nameplateListMirror = false,
+  --- When the player is 2nd on the mob’s threat (by group |UnitDetailedThreatSituation|), use a separate border color (Nameplates tab).
+  nameplateThreatSecondStyle = false,
+  --- Put 2nd-on-threat mobs in the same “aggressives” list column (Appearance tab; uses rank, not just %).
+  listShowSecondInAggroSection = false,
   --- Feature: fade out of combat
   showRaidMarkers = true,
   showCastBar = true,
@@ -64,6 +70,8 @@ local defaults = {
   showRunnerUpBars = false,
   runnerUpBarCount = 3,
   runnerUpBarHeight = 4,
+  --- One bar under your threat: who is 2nd on the full threat table (uses same height as runner-up bars).
+  showSecondOnThreatBar = true,
   showSelfToT = false,
   fadeOutOfCombat = false,
   --- Feature: healer mode
@@ -142,6 +150,26 @@ local defaults = {
   --- — "top" (default) collides with the debuff strip, so raid healers usually want "bottom".
   --- |*OffsetX|/|*OffsetY| nudge the anchor in pixels (+X = right, +Y = up, WoW convention).
   partyFrameShowName     = false,
+  --- Show party/raid member pets as their own frames. Owner's pet appears in the owner's subgroup
+  --- (or group 1 for non-raid). Hunter / warlock / mage / DK pets, plus your own |pet| token. Off by
+  --- default so the layout doesn't suddenly grow when an addon update lands.
+  partyShowPets = false,
+  --- Show buff icons cast BY THE PLAYER on each party/raid member (Renew, PW:Shield, Prayer of
+  --- Mending, Lifebloom, Beacon of Light, etc.). Filter is |caster == "player"|, so other people's
+  --- HoTs aren't shown — keeps the strip focused on what you can actually refresh / manage.
+  partyShowPlayerBuffs = false,
+  partyPlayerBuffSlotCount = 5,
+  partyPlayerBuffIconSize = 14,
+  --- Max base duration (seconds) to show. Filters out auras / blessings / mark of the wild that
+  --- last 5–30 minutes — they're not what healers/DPS-buff-trackers want to see refreshed. Set to
+  --- 0 to disable the filter (show everything you cast). Permanent buffs (duration == 0 in the API)
+  --- are always hidden when the filter is active.
+  partyPlayerBuffMaxDuration = 60,
+  --- Where the buff icon strip sits on each unit frame. "top" / "bottom" run horizontal; "left" /
+  --- "right" stack the icons vertically. X/Y offsets nudge the row in pixels (-50..50).
+  partyPlayerBuffAnchor = "bottom",
+  partyPlayerBuffOffsetX = 0,
+  partyPlayerBuffOffsetY = 0,
   --- Role icon (tank/healer/damager) in the top-left corner of each party/raid frame. Classic lacks
   --- |UnitGroupRolesAssigned|, so live mode only resolves MAINTANK via |GetPartyAssignment|; test
   --- mode uses a fixed fake role cycle so the user can preview the feature.
@@ -190,7 +218,7 @@ local layoutConfigOptionSliderColumns
 --- (spell config rows removed; variable kept for backwards compat with syncConfigInnerLayout)
 local layoutConfigSpellRows
 --- Bump when config layout changes so /el config rebuilds (avoids stuck broken frames).
-local CONFIG_UI_BUILD = 53
+local CONFIG_UI_BUILD = 84
 local rowsAggro = {}
 local rowsOther = {}
 local gridCells = {}
@@ -426,6 +454,9 @@ local function enemyListAfterProfileLoad()
   end
   if type(EnemyList.RefreshNameplateThreatOverlays) == "function" then
     pcall(EnemyList.RefreshNameplateThreatOverlays, true)
+  end
+  if type(EnemyList.RefreshNameplateListMirrors) == "function" then
+    pcall(EnemyList.RefreshNameplateListMirrors, true)
   end
   if type(EnemyList.UpdateFadeOutCombatTicker) == "function" then
     pcall(EnemyList.UpdateFadeOutCombatTicker)
@@ -892,7 +923,11 @@ local function effectiveRowHeight()
   if db.showRunnerUpBars == true and db.showThreatBar ~= false then
     runnerH = math.max(2, math.min(16, tonumber(db.runnerUpBarHeight) or defaults.runnerUpBarHeight))
   end
-  return hpH + threatH + castH + runnerH
+  local secondH = 0
+  if db.showSecondOnThreatBar ~= false and db.showThreatBar ~= false then
+    secondH = math.max(2, math.min(16, tonumber(db.runnerUpBarHeight) or defaults.runnerUpBarHeight)) + 1
+  end
+  return hpH + threatH + castH + secondH + runnerH
 end
 
 local function savePosition()
@@ -914,6 +949,7 @@ local function hideBarRow(r, ooc)
       r:SetFrameLevel((par:GetFrameLevel() or 0) + 2)
     end
     if r.pctBar then r.pctBar:Hide() end
+    if r._elSecondThreatBar then r._elSecondThreatBar:Hide() end
     if r.castBar then r.castBar:Hide() end
     if r.targetHighlight then for _, tex in ipairs(r.targetHighlight) do tex:Hide() end end
     if r.aggroFlash then r.aggroFlash:Hide() end
@@ -923,6 +959,7 @@ local function hideBarRow(r, ooc)
     return
   end
   if r.pctBar then r.pctBar:Hide() end
+  if r._elSecondThreatBar then r._elSecondThreatBar:Hide() end
   if r.castBar then r.castBar:Hide() end
   if r.targetHighlight then for _, tex in ipairs(r.targetHighlight) do tex:Hide() end end
   if r.aggroFlash then r.aggroFlash:Hide() end
@@ -962,6 +999,31 @@ local function createBarRow(parent, frameName)
   local barBg = r.pctBar:CreateTexture(nil, "BACKGROUND")
   barBg:SetAllPoints()
   barBg:SetColorTexture(0, 0, 0, 0.5)
+
+  --- Who is 2nd on the mob’s threat list — one thin bar directly under the player’s threat bar.
+  r._elSecondThreatBar = CreateFrame("StatusBar", nil, r)
+  r._elSecondThreatBar:SetFrameLevel((r:GetFrameLevel() or 0) + 3)
+  r._elSecondThreatBar:SetMinMaxValues(0, 100)
+  r._elSecondThreatBar:SetStatusBarTexture("Interface\\Buttons\\WHITE8X8")
+  r._elSecondThreatBar:SetStatusBarColor(0.35, 0.55, 0.95, 0.9)
+  local stBg = r._elSecondThreatBar:CreateTexture(nil, "BACKGROUND")
+  stBg:SetAllPoints()
+  stBg:SetColorTexture(0, 0, 0, 0.4)
+  r._elSecondThreatBar.nameFs = r._elSecondThreatBar:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+  r._elSecondThreatBar.nameFs:SetPoint("LEFT", r._elSecondThreatBar, "LEFT", 3, 0)
+  r._elSecondThreatBar.nameFs:SetJustifyH("LEFT")
+  r._elSecondThreatBar.nameFs:SetWordWrap(false)
+  r._elSecondThreatBar.nameFs:SetShadowOffset(1, -1)
+  r._elSecondThreatBar.nameFs:SetShadowColor(0, 0, 0, 1)
+  r._elSecondThreatBar.nameFs:SetTextColor(1, 1, 1, 1)
+  r._elSecondThreatBar.pctFs = r._elSecondThreatBar:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+  r._elSecondThreatBar.pctFs:SetPoint("RIGHT", r._elSecondThreatBar, "RIGHT", -3, 0)
+  r._elSecondThreatBar.pctFs:SetJustifyH("RIGHT")
+  r._elSecondThreatBar.pctFs:SetWordWrap(false)
+  r._elSecondThreatBar.pctFs:SetShadowOffset(1, -1)
+  r._elSecondThreatBar.pctFs:SetShadowColor(0, 0, 0, 1)
+  r._elSecondThreatBar.pctFs:SetTextColor(1, 1, 1, 1)
+  r._elSecondThreatBar:Hide()
 
   --- Health bar: fills from left, overlays the threat background.
   r.hpBar = CreateFrame("StatusBar", nil, r)
@@ -1740,6 +1802,9 @@ local function applyBarRow(r, entry, barW, h, castStripW, ooc, font, metaFont)
         end
       end
     end
+    if r._elNameplateMirrorNoTot then
+      showToT = false
+    end
     if showToT and totName then
       r.totIndicator:SetWidth(h)
       r.totIndicator.nameFs:ClearAllPoints()
@@ -1896,6 +1961,42 @@ local function applyBarRow(r, entry, barW, h, castStripW, ooc, font, metaFont)
   end
   if r._threatValueFs then r._threatValueFs:SetText("") end
 
+  --- 2a) Second on full threat list (one bar under the player’s threat; uses runner-up bar height).
+  if r._elSecondThreatBar then
+    local sdb2 = type(EnemyListDB) == "table" and EnemyListDB or defaults
+    local want2 = sdb2.showSecondOnThreatBar ~= false and showThreatBar
+    local st2 = entry.secondOnThreat
+    local isTm = type(EnemyList.IsTestModeOn) == "function" and EnemyList.IsTestModeOn()
+    local can2 = (entry.unit and UnitExists(entry.unit)) or isTm
+    if want2 and st2 and st2.name and can2 then
+      local mb2 = _EL.runnerUpBarHeight()
+      local gap2 = 1
+      topStack = topStack + gap2
+      r._elSecondThreatBar:ClearAllPoints()
+      r._elSecondThreatBar:SetPoint("TOPLEFT", r, "TOPLEFT", 0, -topStack)
+      r._elSecondThreatBar:SetPoint("TOPRIGHT", r, "TOPRIGHT", -totW, -topStack)
+      r._elSecondThreatBar:SetHeight(mb2)
+      local p2 = math.max(0, math.min(100, st2.pct or 0))
+      r._elSecondThreatBar:SetValue(p2)
+      local r2, g2, b2
+      if p2 >= 90 then     r2, g2, b2 = 1.00, 0.30, 0.30
+      elseif p2 >= 70 then r2, g2, b2 = 1.00, 0.85, 0.25
+      else                 r2, g2, b2 = 0.28, 0.60, 0.95
+      end
+      r._elSecondThreatBar:SetStatusBarColor(r2, g2, b2, 0.95)
+      if r._elSecondThreatBar.nameFs and r._elSecondThreatBar.pctFs then
+        applyGridFont(r._elSecondThreatBar.nameFs, mb2 * 5)
+        applyGridFont(r._elSecondThreatBar.pctFs, mb2 * 5)
+        r._elSecondThreatBar.nameFs:SetText(_EL.truncateName(st2.name or ""))
+        r._elSecondThreatBar.pctFs:SetText(math.floor(p2 + 0.5) .. "%")
+      end
+      r._elSecondThreatBar:Show()
+      topStack = topStack + mb2
+    else
+      r._elSecondThreatBar:Hide()
+    end
+  end
+
   --- 2b) Runner-up threat bars — top N non-tanking threats on this enemy, stacked vertically
   --- (one per line) with the player name on the bar and the percentage right-aligned.
   --- Colors: green 0-70%, yellow 70-90%, red 90-100%+. Hidden for stub rows without a unit token.
@@ -2023,17 +2124,31 @@ local function applyBarRow(r, entry, barW, h, castStripW, ooc, font, metaFont)
       local now = GetTime()
       local remaining = entry.castEnd - now
       local duration = (entry.castStart and entry.castEnd) and (entry.castEnd - entry.castStart) or 1
-      if remaining > 0 and duration > 0 then
+      local minRem = 0.02
+      --- Nameplate mirror: tiny remaining times flicker Show/Hide every refresh (instants / timing).
+      if r._elNameplateMirrorNoTot then
+        minRem = 0.15
+      end
+      if remaining > minRem and duration > 0 then
         r.castBar:SetMinMaxValues(0, 1)
         r.castBar:SetValue(1 - (remaining / duration))
         r.castBar.nameFs:SetText(entry.castName)
         r.castBar._countdownFs:SetText(string.format("%.1fs", remaining))
         r.castBar:Show()
+        if r._elNameplateMirrorNoTot and r.castBar.SetAlpha then
+          r.castBar:SetAlpha(1)
+        end
       else
         r.castBar:Hide()
+        if r._elNameplateMirrorNoTot and r.castBar.SetAlpha then
+          r.castBar:SetAlpha(0)
+        end
       end
     else
       r.castBar:Hide()
+      if r._elNameplateMirrorNoTot and r.castBar and r.castBar.SetAlpha then
+        r.castBar:SetAlpha(0)
+      end
     end
   end
 
@@ -2119,6 +2234,115 @@ local function applyBarRow(r, entry, barW, h, castStripW, ooc, font, metaFont)
   end
 end
 
+--- Renders a real list row (HP, threat, cast, text, ToT, markers) in place of the stock nameplate
+--- (parent should cover the |C_NamePlate| root; |npH| scales the row to fit a short nameplate).
+--- Used by |EnemyListNameplateMirror.lua| (load that file *after* this one). Mirror rows: no click/hover.
+function EnemyList.ApplyNameplateMirrorBarRow(parentFrame, unit, entry, npW, npH)
+  if not createBarRow or not applyBarRow or not parentFrame or not unit or not entry or type(entry) ~= "table" then
+    return
+  end
+  if not UnitExists(unit) then
+    return
+  end
+  local wAvail = (type(npW) == "number" and npW > 24) and (npW - 4) or 200
+  local db = type(EnemyListDB) == "table" and EnemyListDB or defaults
+  local listBarW = math.max(80, math.min(500, tonumber(db.width) or defaults.width))
+  local barW
+  if parentFrame._elNameplateMirrorHost then
+    --- Match the nameplate/Plater |unitFrame| width; centering a narrower list width left a ghost bar offset.
+    barW = wAvail
+  else
+    barW = math.min(listBarW, wAvail)
+  end
+  local row = parentFrame.EnemyListNmRow
+  if not row then
+    local guid = (UnitGUID(unit) or "x"):gsub(":", "")
+    local name = "EnemyListNm" .. tostring(guid):sub(1, 32)
+    local ok, r = pcall(function()
+      return createBarRow(parentFrame, name)
+    end)
+    if not ok or not r then
+      return
+    end
+    row = r
+    parentFrame.EnemyListNmRow = row
+    row:EnableMouse(false)
+    if row.SetMouseClickEnabled then
+      row:SetMouseClickEnabled(false)
+    end
+    if row.SetMouseMotionEnabled then
+      row:SetMouseMotionEnabled(false)
+    end
+    row:SetScript("OnEnter", nil)
+    row:SetScript("OnLeave", nil)
+    row:SetScript("OnMouseUp", nil)
+  else
+    pcall(function()
+      row:SetParent(parentFrame)
+    end)
+  end
+  if parentFrame._elNameplateMirrorHost then
+    pcall(function()
+      if row.SetIgnoreParentAlpha then
+        row:SetIgnoreParentAlpha(true)
+      end
+      if row.SetAlpha then
+        row:SetAlpha(1)
+      end
+    end)
+    --- ToT strip is a tall column on the right; on nameplates it often reads as a "black bar" and clips past borders.
+    row._elNameplateMirrorNoTot = true
+  else
+    row._elNameplateMirrorNoTot = nil
+  end
+  local e = {}
+  for k, v in pairs(entry) do
+    e[k] = v
+  end
+  e.unit = unit
+  if (not e.name or e.name == "") and UnitName(unit) then
+    e.name = UnitName(unit)
+  end
+  local h = effectiveRowHeight()
+  local font = fontForPreset(db.fontPreset)
+  local metaFont = fontMetaForPreset(db.fontPreset)
+  local ooc = not (InCombatLockdown and InCombatLockdown())
+  local xOff = 0
+  if not parentFrame._elNameplateMirrorHost and wAvail > barW + 2 then
+    xOff = math.floor((wAvail - barW) * 0.5 + 0.5)
+  end
+  pcall(function()
+    row:ClearAllPoints()
+    local pad = parentFrame._elNameplateMirrorHost and 1 or 0
+    row:SetPoint("TOPLEFT", parentFrame, "TOPLEFT", xOff + pad, 0)
+  end)
+  applyBarRow(row, e, barW, h, 0, ooc, font, metaFont)
+  local scale = 1
+  if type(npH) == "number" and npH > 6 and h > 0 then
+    scale = math.min(1, (npH - 2) / h)
+  end
+  pcall(function()
+    row:SetScale(scale)
+    row:ClearAllPoints()
+    if parentFrame._elNameplateMirrorHost then
+      --- |CENTER| + |SetScale| misaligned the row vs the nameplate; pin from the top (same as stock bars).
+      local pad = 1
+      row:SetPoint("TOPLEFT", parentFrame, "TOPLEFT", xOff + pad, 0)
+    else
+      row:SetPoint("CENTER", parentFrame, "CENTER", 0, 0)
+    end
+  end)
+  pcall(function()
+    if parentFrame.SetClipsChildren then
+      parentFrame:SetClipsChildren(true)
+    end
+  end)
+  --- Mirror parent is a child with |SetAllPoints| on the nameplate — do not |SetWidth|/|SetHeight| here
+  --- (breaks anchor); |npW|/|npH| are only for bar width and row scale.
+  row:Show()
+  parentFrame:Show()
+end
+
 --- Left column = aggroed / high threat; right = not. Lists rebuild every refresh from live threat (see core events).
 local function layoutOneColumn(colFrame, headerFs, title, entries, pool, idPrefix, colW, h, castStripW, ooc, font, metaFont)
   local y = -ROW_TOP_PAD
@@ -2176,6 +2400,13 @@ local function applyMainLayoutSize(wContent, _unused, contentHeightOverride)
   local ch = type(contentHeightOverride) == "number" and contentHeightOverride or rowContainer:GetHeight()
   local baseH = MAIN_HEADER_OFFSET + ch + MAIN_BOTTOM_PAD
   local ok, errSz = pcall(function()
+    local w0, h0 = main:GetWidth(), main:GetHeight()
+    if w0 and h0 and math.abs(w0 - wContent) < 0.5 and math.abs(h0 - baseH) < 0.5 then
+      if mainScaleRoot then
+        mainScaleRoot:SetSize(wContent, baseH)
+      end
+      return
+    end
     main:SetWidth(wContent)
     main:SetHeight(baseH)
   end)
@@ -2465,6 +2696,15 @@ function layoutRows(opt)
   if applyPartyFrameAggroAttackedChrome then
     applyPartyFrameAggroAttackedChrome()
   end
+  if type(EnemyList.RefreshNameplateListMirrors) == "function" then
+    if C_Timer and C_Timer.After then
+      C_Timer.After(0, function()
+        pcall(EnemyList.RefreshNameplateListMirrors)
+      end)
+    else
+      pcall(EnemyList.RefreshNameplateListMirrors)
+    end
+  end
 end
 
 function EnemyList.OnDataChanged()
@@ -2682,21 +2922,73 @@ function _EL.partyFrameShowName()
   return db.partyFrameShowName == true
 end
 
+--- |profileWrite| mirrors profile values into |EnemyListDB[key]| when the active profile matches,
+--- so reading |EnemyListDB[key]| directly is the correct path for "current effective value." Earlier
+--- versions of these helpers called |_EL.profileRead(nil, ...)|, which always returned |defaults[key]|
+--- because |EnemyListDB.profiles[nil]| is just |nil|.
 function _EL.partyShowRoleIcon()
-  local v = _EL.profileRead(nil, "partyShowRoleIcon")
-  if v == nil then
-    local db = type(EnemyListDB) == "table" and EnemyListDB or defaults
-    return db.partyShowRoleIcon == true
-  end
-  return v == true
+  local db = type(EnemyListDB) == "table" and EnemyListDB or defaults
+  return db.partyShowRoleIcon == true
+end
+
+--- Whether pet frames (|pet| / |partypetN| / |raidpetN|) should be laid out in the party/raid
+--- container. Profile-scoped so users can show pets in party but hide them in raid (or vice versa).
+function _EL.partyShowPets()
+  local db = type(EnemyListDB) == "table" and EnemyListDB or defaults
+  return db.partyShowPets == true
+end
+
+--- Whether to show icon strip of buffs cast BY THE PLAYER on each party/raid member.
+function _EL.partyShowPlayerBuffs()
+  local db = type(EnemyListDB) == "table" and EnemyListDB or defaults
+  return db.partyShowPlayerBuffs == true
+end
+
+function _EL.partyPlayerBuffSlotCount()
+  local db = type(EnemyListDB) == "table" and EnemyListDB or defaults
+  local v = tonumber(db.partyPlayerBuffSlotCount) or defaults.partyPlayerBuffSlotCount or 5
+  return math.max(1, math.min(8, math.floor(v + 0.5)))
+end
+
+function _EL.partyPlayerBuffIconSize()
+  local db = type(EnemyListDB) == "table" and EnemyListDB or defaults
+  local v = tonumber(db.partyPlayerBuffIconSize) or defaults.partyPlayerBuffIconSize or 14
+  return math.max(8, math.min(32, math.floor(v + 0.5)))
+end
+
+--- Max base duration (seconds) for buffs to show. 0 = no filter. >0 hides anything longer (auras /
+--- blessings / mark of the wild) and anything with no expiration.
+function _EL.partyPlayerBuffMaxDuration()
+  local db = type(EnemyListDB) == "table" and EnemyListDB or defaults
+  local v = tonumber(db.partyPlayerBuffMaxDuration) or defaults.partyPlayerBuffMaxDuration or 60
+  return math.max(0, math.min(600, math.floor(v + 0.5)))
+end
+
+function _EL.partyPlayerBuffAnchor()
+  local db = type(EnemyListDB) == "table" and EnemyListDB or defaults
+  local v = db.partyPlayerBuffAnchor
+  if v == "top" or v == "bottom" or v == "left" or v == "right" then return v end
+  return "bottom"
+end
+
+local PLAYER_BUFF_OFFSET_MIN, PLAYER_BUFF_OFFSET_MAX = -50, 50
+function _EL.partyPlayerBuffOffsetX()
+  local db = type(EnemyListDB) == "table" and EnemyListDB or defaults
+  local v = tonumber(db.partyPlayerBuffOffsetX) or 0
+  if v ~= v then v = 0 end
+  return math.max(PLAYER_BUFF_OFFSET_MIN, math.min(PLAYER_BUFF_OFFSET_MAX, math.floor(v + 0.5)))
+end
+
+function _EL.partyPlayerBuffOffsetY()
+  local db = type(EnemyListDB) == "table" and EnemyListDB or defaults
+  local v = tonumber(db.partyPlayerBuffOffsetY) or 0
+  if v ~= v then v = 0 end
+  return math.max(PLAYER_BUFF_OFFSET_MIN, math.min(PLAYER_BUFF_OFFSET_MAX, math.floor(v + 0.5)))
 end
 
 function _EL.partyRoleIconSize()
-  local v = tonumber(_EL.profileRead(nil, "partyRoleIconSize"))
-  if not v then
-    local db = type(EnemyListDB) == "table" and EnemyListDB or defaults
-    v = tonumber(db.partyRoleIconSize) or defaults.partyRoleIconSize or 12
-  end
+  local db = type(EnemyListDB) == "table" and EnemyListDB or defaults
+  local v = tonumber(db.partyRoleIconSize) or defaults.partyRoleIconSize or 12
   return math.max(6, math.min(32, v))
 end
 
@@ -2765,9 +3057,12 @@ function _EL.runnerUpBarHeight()
   return math.max(2, math.min(16, math.floor(tonumber(db.runnerUpBarHeight) or defaults.runnerUpBarHeight)))
 end
 
---- Returns a table of { name, pct, isTanking } for the top |limit| non-tanking threat holders on
---- |unit|, sorted desc by pct. Uses UnitDetailedThreatSituation so it Just Works for anyone in
---- the group (not only the local player). Missing API / no-group = empty result.
+--- Returns a table of { name, pct, isTanking } for the top |limit| threat holders on |unit|,
+--- sorted desc by pct. The current aggro holder (tank) is included at the top, followed by the
+--- runner-ups — so a tank reading the bars sees themself first then the DPS climbing behind them.
+--- |UnitDetailedThreatSituation| is called for every group member so this works for anyone, not
+--- just the local player. Missing API / no-group = empty result. Names are de-duplicated to guard
+--- against a unit appearing under more than one token.
 function _EL.computeRunnerUpThreats(unit, limit)
   limit = tonumber(limit) or 3
   if not unit or not UnitExists(unit) or type(UnitDetailedThreatSituation) ~= "function" then
@@ -2780,26 +3075,23 @@ function _EL.computeRunnerUpThreats(unit, limit)
     for i = 1, 4 do members[#members + 1] = "party" .. i end
   end
   local tmp = {}
-  local tankerName
+  local seen = {}
   for _, m in ipairs(members) do
     if UnitExists(m) then
-      local ok, isTanking, _, pct, _, _ = pcall(UnitDetailedThreatSituation, m, unit)
-      if ok and type(pct) == "number" and pct > 0 then
-        tmp[#tmp + 1] = { name = UnitName(m) or "?", pct = pct, isTanking = isTanking and true or false }
-        if isTanking then tankerName = UnitName(m) end
+      local nm = UnitName(m)
+      if nm and not seen[nm] then
+        local ok, isTanking, _, pct, _, _ = pcall(UnitDetailedThreatSituation, m, unit)
+        if ok and type(pct) == "number" and pct > 0 then
+          tmp[#tmp + 1] = { name = nm, pct = pct, isTanking = isTanking and true or false }
+          seen[nm] = true
+        end
       end
     end
   end
   table.sort(tmp, function(a, b) return a.pct > b.pct end)
-  --- Drop the current aggro holder — user wants "how close is 2nd place?"
   local out = {}
-  for _, t in ipairs(tmp) do
-    if tankerName and t.name == tankerName and #out == 0 then
-      --- skip the tank once
-    else
-      out[#out + 1] = t
-      if #out >= limit then break end
-    end
+  for i = 1, math.min(#tmp, limit) do
+    out[i] = tmp[i]
   end
   return out
 end
@@ -3152,10 +3444,32 @@ function updatePartyFrameSize()
 
   --- Collect only visible/existing units, grouped by raid subgroup.
   --- group[n] = list of unit frame references in that group.
+  local showPets = _EL.partyShowPets()
+  local function isPetUnit(u)
+    if type(u) ~= "string" then return false end
+    return u == "pet" or u:match("^partypet%d+$") or u:match("^raidpet%d+$")
+  end
+  --- Test mode: scope the preview to the active profile's group size, otherwise all 90 frames
+  --- (player + party + pet + partypet + 40 raid + 40 raidpet) flood the screen and the party
+  --- config tab looks broken. Party profile shows player+party1-4+pets; Raid shows raid1-40+pets.
+  local activeProfile = (type(EnemyListDB) == "table" and EnemyListDB.activeProfileName) or "party"
+  local function inActiveTestProfile(u)
+    if not isTestMode then return true end
+    if activeProfile == "raid" then
+      return type(u) == "string" and (u:match("^raid%d") and not u:match("^raidpet")) or (u and u:match("^raidpet%d"))
+    end
+    --- Party / custom profiles preview as 5-man.
+    return u == "player" or (type(u) == "string" and (u:match("^party%d+$") or u == "pet" or u:match("^partypet%d+$")))
+  end
   local groups = {}
   for fi, uf in ipairs(partyUnitFrames) do
     local unit = uf._elUnit
+    local petUnit = isPetUnit(unit)
     local exists = isTestMode or (unit and UnitExists(unit))
+    --- Pet frames are skipped unless the toggle is on.
+    if petUnit and not showPets then exists = false end
+    --- Test mode: filter to profile-appropriate units only.
+    if isTestMode and not inActiveTestProfile(unit) then exists = false end
     --- Omit player/party slots from the raid grid; only |raidN| frames represent the roster.
     local skipDuplicateRosterSlot = inRaid and unit
       and (unit == "player" or (type(unit) == "string" and unit:match("^party%d+$")))
@@ -3166,19 +3480,38 @@ function updatePartyFrameSize()
         uf:Show()
         uf._elTestShown = true
       end
-      --- Determine raid subgroup (1-based). Party / solo: everyone in logical group 1.
+      --- Determine raid subgroup (1-based). Party / solo: everyone in logical group 1. Pets follow
+      --- their owner's group: |raidpetN| → subgroup of |raidN|; |pet| / |partypetN| → group 1.
       local subgroup = 1
       if isTestMode then
-        subgroup = math.floor((fi - 1) / 5) + 1
-      elseif unit and unit:match("^raid%d") then
+        if unit == "pet" or (type(unit) == "string" and unit:match("^partypet%d+$")) then
+          --- Owner is player / partyN → group 1 in test mode (same as the 5-man party block).
+          subgroup = 1
+        elseif type(unit) == "string" and unit:match("^raidpet%d+$") then
+          --- Mirror raidN's test subgroup. Test mode buckets raid units by the same |fi/5| math, so
+          --- compute the raid index → its fi (11 + N - 1) → its bucket.
+          local raidIdx = tonumber(unit:match("^raidpet(%d+)$")) or 1
+          local ownerFi = 10 + raidIdx
+          subgroup = math.floor((ownerFi - 1) / 5) + 1
+        else
+          subgroup = math.floor((fi - 1) / 5) + 1
+        end
+      elseif unit and unit:match("^raid%d") and not unit:match("^raidpet") then
         local raidIdx = tonumber(unit:match("^raid(%d+)$"))
         if raidIdx and GetRaidRosterInfo then
           local ok, _, _, sg = pcall(GetRaidRosterInfo, raidIdx)
           if ok and type(sg) == "number" and sg >= 1 then subgroup = sg end
         end
+      elseif unit and unit:match("^raidpet%d") then
+        local raidIdx = tonumber(unit:match("^raidpet(%d+)$"))
+        if raidIdx and GetRaidRosterInfo then
+          local ok, _, _, sg = pcall(GetRaidRosterInfo, raidIdx)
+          if ok and type(sg) == "number" and sg >= 1 then subgroup = sg end
+        end
       end
-      if not groups[subgroup] then groups[subgroup] = {} end
-      groups[subgroup][#groups[subgroup] + 1] = uf
+      if not groups[subgroup] then groups[subgroup] = { members = {}, pets = {} } end
+      local bucket = petUnit and groups[subgroup].pets or groups[subgroup].members
+      bucket[#bucket + 1] = uf
     elseif skipDuplicateRosterSlot and exists then
       --- Park duplicate roster UI off-screen (same as unused slots).
       uf:ClearAllPoints()
@@ -3197,21 +3530,28 @@ function updatePartyFrameSize()
     end
   end
 
-  --- Sort group keys and lay out.
+  --- Sort group keys and lay out. Each group has a |members| list and a |pets| list. Members fill
+  --- the primary lane (column for vertical layout, row for horizontal); pets occupy a secondary lane
+  --- right after, separated by a small extra |petGap| so they read as a distinct strip.
   local sortedGroups = {}
   for g in pairs(groups) do sortedGroups[#sortedGroups + 1] = g end
   table.sort(sortedGroups)
 
   local maxPerGroup = 0
-  local groupCount = #sortedGroups
+  local maxPetsPerGroup = 0
   for _, g in ipairs(sortedGroups) do
-    maxPerGroup = math.max(maxPerGroup, #groups[g])
+    local gd = groups[g]
+    maxPerGroup = math.max(maxPerGroup, #gd.members)
+    maxPetsPerGroup = math.max(maxPetsPerGroup, #gd.pets)
   end
+  local petGap = (maxPetsPerGroup > 0) and math.max(gap + 4, 6) or 0
 
   --- Use actual group number (1-based) as the position index so empty groups leave gaps.
   local maxGroupNum = 0
   for _, g in ipairs(sortedGroups) do
-    local members = groups[g]
+    local gd = groups[g]
+    local members = gd.members
+    local pets    = gd.pets
     local gPos = g - 1  -- 0-based position matching the group number
     for m, uf in ipairs(members) do
       uf:SetSize(sz, sz)
@@ -3226,15 +3566,42 @@ function updatePartyFrameSize()
         uf:SetPoint("TOPLEFT", partyFrameContainer, "TOPLEFT", x, y)
       end
     end
+    --- Pet strip: separated by |petGap| from members so it reads as its own row/column. Pets lay
+    --- out in the same direction as members but in the lane right after the longest member lane.
+    --- Vertical layout: pets stack to the RIGHT of the member column.
+    --- Horizontal layout: pets stack BELOW the member row.
+    for p, uf in ipairs(pets) do
+      uf:SetSize(sz, sz)
+      uf:ClearAllPoints()
+      if vertical then
+        local x = gPos * (sz + groupGap) + sz + petGap
+        local y = -((p - 1) * (sz + gap))
+        uf:SetPoint("TOPLEFT", partyFrameContainer, "TOPLEFT", x, y)
+      else
+        local x = (p - 1) * (sz + gap)
+        local y = -(gPos * (sz + groupGap)) - sz - petGap
+        uf:SetPoint("TOPLEFT", partyFrameContainer, "TOPLEFT", x, y)
+      end
+    end
     maxGroupNum = math.max(maxGroupNum, g)
   end
 
   if maxGroupNum == 0 then maxGroupNum = 1 end
   if maxPerGroup == 0 then maxPerGroup = 1 end
+  --- Container size accounts for the optional pet strip width (vertical) or height (horizontal).
+  local memberExtent = maxPerGroup * sz + (maxPerGroup - 1) * gap
+  local petExtent    = maxPetsPerGroup > 0 and (maxPetsPerGroup * sz + (maxPetsPerGroup - 1) * gap) or 0
+  local groupExtent  = maxGroupNum * (sz + groupGap) - groupGap
   if vertical then
-    partyFrameContainer:SetSize(maxGroupNum * (sz + groupGap) - groupGap, maxPerGroup * sz + (maxPerGroup - 1) * gap)
+    --- Vertical: each "group" is a column; pets sit beside members (extra column width per group).
+    local groupColW = sz + (maxPetsPerGroup > 0 and (sz + petGap) or 0)
+    local totalW    = maxGroupNum * (groupColW + groupGap) - groupGap
+    partyFrameContainer:SetSize(totalW, math.max(memberExtent, petExtent))
   else
-    partyFrameContainer:SetSize(maxPerGroup * sz + (maxPerGroup - 1) * gap, maxGroupNum * (sz + groupGap) - groupGap)
+    --- Horizontal: each "group" is a row; pets sit below the row.
+    local groupRowH = sz + (maxPetsPerGroup > 0 and (sz + petGap) or 0)
+    local totalH    = maxGroupNum * (groupRowH + groupGap) - groupGap
+    partyFrameContainer:SetSize(math.max(memberExtent, petExtent), totalH)
   end
   if syncPartyFrameUnitChrome then
     syncPartyFrameUnitChrome()
@@ -3489,6 +3856,161 @@ hidePartyDispelIndicators = function(uf)
     end
   end
 end
+
+--- Position the player-buff strip on one of the four edges of the unit frame, with optional pixel
+--- offsets. "top" / "bottom" run icons left-to-right (horizontal); "left" / "right" stack them
+--- top-to-bottom (vertical). Icons shrink automatically when the frame is too small to fit them all.
+local function layoutPartyPlayerBuffRow(uf)
+  if not uf._elPlayerBuffRow or not uf._elPlayerBuffSlots then return end
+  local n = _EL.partyPlayerBuffSlotCount()
+  local iconSz = _EL.partyPlayerBuffIconSize()
+  local anchor = _EL.partyPlayerBuffAnchor()
+  local ox = _EL.partyPlayerBuffOffsetX()
+  local oy = _EL.partyPlayerBuffOffsetY()
+  local pad = 2
+  local gap = 1
+  local fw = uf:GetWidth() or 40
+  local fh = uf:GetHeight() or 40
+  local horizontal = (anchor == "top" or anchor == "bottom")
+  local mainExtent = horizontal and math.max(8, fw - pad * 2) or math.max(8, fh - pad * 2)
+  local maxFit = math.max(1, math.floor((mainExtent + gap) / (iconSz + gap)))
+  if n > maxFit then iconSz = math.max(8, math.floor((mainExtent - gap * (n - 1)) / n)) end
+  uf._elPlayerBuffRow:ClearAllPoints()
+  if anchor == "top" then
+    uf._elPlayerBuffRow:SetPoint("TOPLEFT", uf, "TOPLEFT", pad + ox, -pad + oy)
+    uf._elPlayerBuffRow:SetSize(mainExtent, iconSz)
+  elseif anchor == "bottom" then
+    uf._elPlayerBuffRow:SetPoint("BOTTOMLEFT", uf, "BOTTOMLEFT", pad + ox, pad + oy)
+    uf._elPlayerBuffRow:SetSize(mainExtent, iconSz)
+  elseif anchor == "left" then
+    uf._elPlayerBuffRow:SetPoint("TOPLEFT", uf, "TOPLEFT", pad + ox, -pad + oy)
+    uf._elPlayerBuffRow:SetSize(iconSz, mainExtent)
+  else  -- right
+    uf._elPlayerBuffRow:SetPoint("TOPRIGHT", uf, "TOPRIGHT", -pad + ox, -pad + oy)
+    uf._elPlayerBuffRow:SetSize(iconSz, mainExtent)
+  end
+  --- Highest level on the unit so icons paint above HP / mana fills (StatusBar children sit at +1).
+  uf._elPlayerBuffRow:SetFrameLevel((uf:GetFrameLevel() or 0) + 8)
+  for i = 1, 8 do
+    local cell = uf._elPlayerBuffSlots[i]
+    if cell and cell.frame then
+      cell.frame:ClearAllPoints()
+      if i <= n then
+        cell.frame:SetSize(iconSz, iconSz)
+        local off = (i - 1) * (iconSz + gap)
+        if anchor == "top" then
+          cell.frame:SetPoint("TOPLEFT", uf._elPlayerBuffRow, "TOPLEFT", off, 0)
+        elseif anchor == "bottom" then
+          cell.frame:SetPoint("BOTTOMLEFT", uf._elPlayerBuffRow, "BOTTOMLEFT", off, 0)
+        elseif anchor == "left" then
+          cell.frame:SetPoint("TOPLEFT", uf._elPlayerBuffRow, "TOPLEFT", 0, -off)
+        else  -- right
+          cell.frame:SetPoint("TOPRIGHT", uf._elPlayerBuffRow, "TOPRIGHT", 0, -off)
+        end
+      else
+        cell.frame:Hide()
+      end
+    end
+  end
+  --- Scale the small text to icon size (countdown digits + stack count).
+  local textSz = math.max(6, math.floor(iconSz * 0.45))
+  for i = 1, 8 do
+    local cell = uf._elPlayerBuffSlots[i]
+    if cell then
+      pcall(function()
+        local f0 = cell.cd:GetFont()
+        if f0 then cell.cd:SetFont(f0, textSz, "OUTLINE") end
+      end)
+      pcall(function()
+        local f0 = cell.count:GetFont()
+        if f0 then cell.count:SetFont(f0, textSz, "OUTLINE") end
+      end)
+    end
+  end
+end
+
+--- Iterate buffs on |unit| and populate up to |slotCount| icons for those cast by the player.
+--- Called from |_EL.updatePartyUnitFrame|. Hides the strip entirely when the option is off, so the
+--- rest of the frame layout doesn't have to know about it.
+local function updatePartyPlayerBuffs(uf)
+  if not uf or not uf._elPlayerBuffSlots then return end
+  if not _EL.partyShowPlayerBuffs() then
+    for i = 1, 8 do
+      local cell = uf._elPlayerBuffSlots[i]
+      if cell and cell.frame then cell.frame:Hide() end
+    end
+    if uf._elPlayerBuffRow then uf._elPlayerBuffRow:Hide() end
+    return
+  end
+  uf._elPlayerBuffRow:Show()
+  layoutPartyPlayerBuffRow(uf)
+  local unit = uf._elUnit
+  if not unit or not UnitExists(unit) then
+    for i = 1, 8 do
+      local cell = uf._elPlayerBuffSlots[i]
+      if cell and cell.frame then cell.frame:Hide() end
+    end
+    return
+  end
+  local n = _EL.partyPlayerBuffSlotCount()
+  local maxDur = _EL.partyPlayerBuffMaxDuration()  --- 0 means "show all"
+  local now = GetTime()
+  local found = 0
+  --- Walk auras until UnitBuff returns nil (Vanilla style). Filter to caster == "player". When
+  --- |maxDur| is set, also drop anything with a base duration longer than that, plus permanent
+  --- (duration == 0) buffs — those are auras / blessings / Mark of the Wild that don't need to
+  --- be tracked for refreshing.
+  local idx = 1
+  while idx <= 40 and found < n do
+    local name, icon, count, _, duration, expirationTime, source
+    local ok, r1, r2, r3, r4, r5, r6, r7 = pcall(UnitBuff, unit, idx)
+    if ok then
+      name, icon, count, _, duration, expirationTime, source = r1, r2, r3, r4, r5, r6, r7
+    end
+    if not name then break end
+    local durationOk = true
+    if maxDur > 0 then
+      if type(duration) ~= "number" or duration <= 0 or duration > maxDur then
+        durationOk = false
+      end
+    end
+    if source == "player" and durationOk then
+      found = found + 1
+      local cell = uf._elPlayerBuffSlots[found]
+      if cell and cell.frame then
+        cell.frame:Show()
+        if icon then cell.icon:SetTexture(icon) end
+        if type(count) == "number" and count > 1 then
+          cell.count:SetText(tostring(count))
+        else
+          cell.count:SetText("")
+        end
+        if type(duration) == "number" and duration > 0 and type(expirationTime) == "number" then
+          local left = expirationTime - now
+          if left > 0 then
+            if left >= 60 then
+              cell.cd:SetText(math.floor(left / 60 + 0.5) .. "m")
+            elseif left >= 10 then
+              cell.cd:SetText(math.floor(left + 0.5))
+            else
+              cell.cd:SetText(string.format("%.1f", left))
+            end
+          else
+            cell.cd:SetText("")
+          end
+        else
+          cell.cd:SetText("")
+        end
+      end
+    end
+    idx = idx + 1
+  end
+  for i = found + 1, 8 do
+    local cell = uf._elPlayerBuffSlots[i]
+    if cell and cell.frame then cell.frame:Hide() end
+  end
+end
+_EL.updatePartyPlayerBuffs = updatePartyPlayerBuffs
 
 applyPartyFrameAggroAttackedChrome = function()
   if not partyFrameContainer or not partyFrameContainer:IsShown() then
@@ -3973,6 +4495,11 @@ function _EL.updatePartyUnitFrame(uf)
       end
     end
   end
+  --- Player buff icon strip refresh. Cheap (caps at 8 icons + 40 aura iterations) so we run it
+  --- alongside the per-frame data update; UNIT_AURA also funnels through |updatePartyUnitFrame|.
+  if uf._elPlayerBuffSlots then
+    updatePartyPlayerBuffs(uf)
+  end
 end
 
 local function createPartyFrames()
@@ -4042,9 +4569,14 @@ local function createPartyFrames()
   end
 
   --- 5 party/solo tokens + raid1..N (in raid, player/party* are parked; see |updatePartyFrameSize|).
-  local units = { "player", "party1", "party2", "party3", "party4" }
+  --- Pet tokens (|pet|, |partypetN|, |raidpetN|) are always created so toggling the option doesn't
+  --- need a /reload — they're hidden by default via the layout pass when |partyShowPets| is off.
+  local units = { "player", "party1", "party2", "party3", "party4", "pet", "partypet1", "partypet2", "partypet3", "partypet4" }
   for ri = 1, PARTY_FRAME_RAID_UNIT_MAX do
     units[#units + 1] = "raid" .. ri
+  end
+  for ri = 1, PARTY_FRAME_RAID_UNIT_MAX do
+    units[#units + 1] = "raidpet" .. ri
   end
   for i, unit in ipairs(units) do
     local frameName = "EnemyListPartyUF" .. i
@@ -4162,6 +4694,38 @@ local function createPartyFrames()
       uf._elDispelSq[slot] = { frame = wrap, tex = tex, fs = fs }
     end
 
+    --- Player-buff strip: icons of buffs cast BY THE PLAYER on this unit (Renew, PW:Shield, PoM…).
+    --- Anchored to the BOTTOM of the frame (positioned by |layoutPartyPlayerBuffRow|), so it does
+    --- not collide with the dispel strip on top. Each slot has an icon texture, an outline border,
+    --- a stack-count FontString (top-right), and a remaining-time FontString (bottom-center).
+    local buffRow = CreateFrame("Frame", nil, uf)
+    uf._elPlayerBuffRow = buffRow
+    uf._elPlayerBuffSlots = {}
+    --- Always allocate the max possible slot count (8). Layout shows only the user-configured count.
+    for slot = 1, 8 do
+      local btn = CreateFrame("Frame", nil, buffRow)
+      btn:Hide()
+      local icon = btn:CreateTexture(nil, "ARTWORK")
+      icon:SetAllPoints()
+      icon:SetTexCoord(0.08, 0.92, 0.08, 0.92)  -- trim default Blizzard icon border
+      local border = btn:CreateTexture(nil, "OVERLAY")
+      border:SetAllPoints()
+      border:SetColorTexture(0, 0, 0, 0)  -- placeholder; we'll just rely on the icon's own border
+      local cd = btn:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+      cd:SetPoint("BOTTOM", btn, "BOTTOM", 0, 0)
+      cd:SetJustifyH("CENTER")
+      cd:SetTextColor(1, 1, 0.6, 1)
+      cd:SetShadowOffset(1, -1)
+      cd:SetShadowColor(0, 0, 0, 1)
+      local count = btn:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+      count:SetPoint("TOPRIGHT", btn, "TOPRIGHT", 1, 1)
+      count:SetJustifyH("RIGHT")
+      count:SetTextColor(1, 1, 1, 1)
+      count:SetShadowOffset(1, -1)
+      count:SetShadowColor(0, 0, 0, 1)
+      uf._elPlayerBuffSlots[slot] = { frame = btn, icon = icon, border = border, cd = cd, count = count }
+    end
+
     --- Border (4 edges, color changes dynamically when attacked). Sublevel 6 so the flash border
     --- below can sit on top at sublevel 7 (Blizzard caps sublevels at -8..7).
     uf._elBorders = {}
@@ -4267,7 +4831,8 @@ local function createPartyFrames()
   if not partyUnitWatchFrame then
     partyUnitWatchFrame = CreateFrame("Frame", "EnemyListPartyUnitWatch", UIParent)
     partyUnitWatchFrame:SetScript("OnEvent", function(_, event, unit)
-      if event == "GROUP_ROSTER_UPDATE" then
+      if event == "GROUP_ROSTER_UPDATE" or event == "UNIT_PET" then
+        --- A pet was summoned / dismissed — re-layout so |raidpetN| etc. join or leave the grid.
         if partyFrameContainer and type(EnemyListDB) == "table" and EnemyListDB.showPartyFrames then
           if not InCombatLockdown() then
             updatePartyFrameSize()
@@ -4301,6 +4866,7 @@ local function createPartyFrames()
     partyUnitWatchFrame:RegisterEvent("UNIT_NAME_UPDATE")
     partyUnitWatchFrame:RegisterEvent("UNIT_AURA")
     partyUnitWatchFrame:RegisterEvent("GROUP_ROSTER_UPDATE")
+    pcall(function() partyUnitWatchFrame:RegisterEvent("UNIT_PET") end)
     pcall(function() partyUnitWatchFrame:RegisterEvent("UNIT_POWER_UPDATE") end)
     pcall(function() partyUnitWatchFrame:RegisterEvent("UNIT_POWER_FREQUENT") end)
     pcall(function() partyUnitWatchFrame:RegisterEvent("UNIT_MAXPOWER") end)
@@ -4390,38 +4956,132 @@ local function createPartyFrames()
       return
     end
     local testPartyClasses = EL_TEST_PARTY_CLASSES
+    --- Test mode uses |partyShowPets| to skip pet frame visuals when the toggle is off, and scopes
+    --- the preview to the active profile (party = 5-man + pets; raid = 40-man + pets). Without the
+    --- profile filter the user gets all 90 frames force-shown and the party config tab looks broken.
+    local showPetsTest = _EL.partyShowPets()
+    local activeProfTest = (type(EnemyListDB) == "table" and EnemyListDB.activeProfileName) or "party"
+    local function isPetUnitTokenLocal(u)
+      if type(u) ~= "string" then return false end
+      return u == "pet" or u:match("^partypet%d+$") or u:match("^raidpet%d+$")
+    end
+    local function inActiveTestProfileLocal(u)
+      if activeProfTest == "raid" then
+        return type(u) == "string" and (u:match("^raid%d") and not u:match("^raidpet")) or (u and u:match("^raidpet%d"))
+      end
+      return u == "player" or (type(u) == "string" and (u:match("^party%d+$") or u == "pet" or u:match("^partypet%d+$")))
+    end
     for i, uf in ipairs(partyUnitFrames) do
-      if not uf:IsShown() and not InCombatLockdown() then
-        UnregisterUnitWatch(uf)
-        uf:Show()
-      end
-      local fakeMax = 380 + ((i * 13 + (i % 7) * 19) % 26) * 62
-      local pct = math.min(0.92, math.max(0.18, 0.12 + ((i * 17 + (i % 3)) % 72) / 100))
-      if uf._elHpBar then
-        uf._elHpBar:SetValue(pct)
-      end
-      if uf._elHpDeficitFs then
-        if partyFrameHpDeficitEnabled() then
-          local def = math.floor(fakeMax * (1 - pct) + 0.5)
-          if def > 0 then
-            setPartyHpDeficitTextAllLayers(uf, string.format(L.HP_DEFICIT, def))
-            applyPartyHpDeficitColors(uf)
+      local isPet = isPetUnitTokenLocal(uf._elUnit)
+      local outOfProfile = not inActiveTestProfileLocal(uf._elUnit)
+      if outOfProfile then
+        --- Frames belonging to the inactive profile: hide entirely so the preview stays scoped.
+        if uf._elTestShown and not InCombatLockdown() then
+          uf._elTestShown = nil
+          RegisterUnitWatch(uf)
+        end
+        uf:Hide()
+      elseif isPet and not showPetsTest then
+        if uf._elTestShown and not InCombatLockdown() then
+          uf._elTestShown = nil
+          RegisterUnitWatch(uf)
+        end
+        uf:Hide()
+      else
+        if not uf:IsShown() and not InCombatLockdown() then
+          UnregisterUnitWatch(uf)
+          uf:Show()
+        end
+        local fakeMax = 380 + ((i * 13 + (i % 7) * 19) % 26) * 62
+        local pct = math.min(0.92, math.max(0.18, 0.12 + ((i * 17 + (i % 3)) % 72) / 100))
+        --- Pets get a tighter HP range so they read as "smaller" health pools at a glance.
+        if isPet then
+          fakeMax = math.floor(fakeMax * 0.45)
+          pct = math.min(0.95, math.max(0.25, 0.20 + ((i * 23 + (i % 5)) % 65) / 100))
+        end
+        if uf._elHpBar then
+          uf._elHpBar:SetValue(pct)
+        end
+        if uf._elHpDeficitFs then
+          if partyFrameHpDeficitEnabled() then
+            local def = math.floor(fakeMax * (1 - pct) + 0.5)
+            if def > 0 then
+              setPartyHpDeficitTextAllLayers(uf, string.format(L.HP_DEFICIT, def))
+              applyPartyHpDeficitColors(uf)
+            else
+              setPartyHpDeficitTextAllLayers(uf, "")
+            end
           else
             setPartyHpDeficitTextAllLayers(uf, "")
           end
+        end
+        if isPet then
+          --- Pets: warm tan tint reminiscent of beast/creature coloring (same hue used for the
+          --- creature-type Beast color on enemy rows). Distinct from class colors so the strip
+          --- visually reads as "pets" without needing class lookups.
+          if uf._elHpBar then
+            uf._elHpBar:SetStatusBarColor(0.7, 0.5, 0.3)
+          end
         else
-          setPartyHpDeficitTextAllLayers(uf, "")
+          local cls = testPartyClasses[i]
+          if cls and RAID_CLASS_COLORS and RAID_CLASS_COLORS[cls] then
+            local c = RAID_CLASS_COLORS[cls]
+            if uf._elHpBar then
+              uf._elHpBar:SetStatusBarColor(c.r, c.g, c.b)
+            end
+          end
         end
-      end
-      local cls = testPartyClasses[i]
-      if cls and RAID_CLASS_COLORS and RAID_CLASS_COLORS[cls] then
-        local c = RAID_CLASS_COLORS[cls]
-        if uf._elHpBar then
-          uf._elHpBar:SetStatusBarColor(c.r, c.g, c.b)
+        updatePartyDispelIndicatorsTest(uf, i)
+        --- Fake player-buff icons in test mode: cycle a few well-known healer HoT icons so the
+        --- strip is visibly testable. Real units use |UnitBuff(unit, idx)| filtered to caster=="player".
+        if uf._elPlayerBuffSlots and _EL.partyShowPlayerBuffs() then
+          local n = _EL.partyPlayerBuffSlotCount()
+          local layoutFn = layoutPartyPlayerBuffRow
+          if layoutFn then layoutFn(uf) end
+          uf._elPlayerBuffRow:Show()
+          --- Spell IDs (FileDataIDs work too, but spellId → GetSpellTexture is portable across builds).
+          local fakeBuffs = {
+            { id = 139,    name = "Renew",            count = 0, dur = 15 },
+            { id = 17,     name = "Power Word: Shield", count = 0, dur = 30 },
+            { id = 33076,  name = "Prayer of Mending", count = 4, dur = 30 },
+            { id = 774,    name = "Rejuvenation",     count = 0, dur = 12 },
+            { id = 26980,  name = "Lifebloom",        count = 3, dur = 7 },
+            { id = 53563,  name = "Beacon of Light",  count = 0, dur = 60 },
+            { id = 41635,  name = "Prayer of Mending", count = 1, dur = 22 },
+            { id = 8936,   name = "Regrowth",         count = 0, dur = 18 },
+          }
+          local shown = math.min(n, ((i - 1) % 5) + 1)  -- vary count per slot
+          local now = GetTime()
+          for s = 1, 8 do
+            local cell = uf._elPlayerBuffSlots[s]
+            if not cell then break end
+            if s <= shown then
+              local b = fakeBuffs[((i + s - 2) % #fakeBuffs) + 1]
+              local gtex
+              if type(GetSpellTexture) == "function" then
+                local ok, result = pcall(GetSpellTexture, b.id)
+                if ok then gtex = result end
+              end
+              cell.icon:SetTexture((type(gtex) == "string" or type(gtex) == "number") and gtex or "Interface\\Icons\\INV_Misc_QuestionMark")
+              if b.count > 0 then cell.count:SetText(tostring(b.count)) else cell.count:SetText("") end
+              local left = b.dur
+              if left >= 60 then cell.cd:SetText(math.floor(left / 60 + 0.5) .. "m")
+              elseif left >= 10 then cell.cd:SetText(math.floor(left + 0.5))
+              else cell.cd:SetText(string.format("%.1f", left)) end
+              cell.frame:Show()
+            else
+              cell.frame:Hide()
+            end
+          end
+        elseif uf._elPlayerBuffRow then
+          uf._elPlayerBuffRow:Hide()
+          for s = 1, 8 do
+            local cell = uf._elPlayerBuffSlots and uf._elPlayerBuffSlots[s]
+            if cell and cell.frame then cell.frame:Hide() end
+          end
         end
+        uf._elTestShown = true
       end
-      updatePartyDispelIndicatorsTest(uf, i)
-      uf._elTestShown = true
     end
   end)
 end
@@ -4590,6 +5250,11 @@ local function createMainFrame()
   --- Feature 6: fade out of combat — OnUpdate only while enabled (no per-frame work when off).
   mainFadeTickerFrame = CreateFrame("Frame")
   local fadeAcc = 0
+  --- Stabilize "combat" for fade: group/player combat can read inconsistently for a few ticks, which
+  --- was flashing |main| between full and dim every 0.2s. Require two consecutive "OOC" samples before
+  --- dimming; go bright on combat immediately.
+  local fadeOocStreak = 0
+  local FADE_OOC_STREAK_DIM = 2
   local function mainFadeTickerOnUpdate(_, elapsed)
     fadeAcc = fadeAcc + elapsed
     if fadeAcc < 0.2 then
@@ -4598,6 +5263,15 @@ local function createMainFrame()
     fadeAcc = 0
     if not main then
       return
+    end
+    local function applyMainAlphaIfNeeded(a)
+      local c = (main.GetAlpha and main:GetAlpha()) or 1
+      if math.abs(c - a) < 0.02 then
+        return
+      end
+      pcall(function()
+        main:SetAlpha(a)
+      end)
     end
     local db = type(EnemyListDB) == "table" and EnemyListDB or {}
     if db.fadeOutOfCombat then
@@ -4608,13 +5282,18 @@ local function createMainFrame()
         inCombatCtx = UnitAffectingCombat("player")
       end
       if inCombatCtx then
-        main:SetAlpha(1)
+        fadeOocStreak = 0
+        applyMainAlphaIfNeeded(1)
       else
-        main:SetAlpha(0.3)
+        fadeOocStreak = fadeOocStreak + 1
+        if fadeOocStreak >= FADE_OOC_STREAK_DIM then
+          applyMainAlphaIfNeeded(0.3)
+        end
       end
     else
-      if main:GetAlpha() < 0.9 then
-        main:SetAlpha(1)
+      fadeOocStreak = 0
+      if (main.GetAlpha and main:GetAlpha() or 1) < 0.9 then
+        applyMainAlphaIfNeeded(1)
       end
     end
   end
@@ -4624,6 +5303,7 @@ local function createMainFrame()
     if not f then
       return
     end
+    fadeOocStreak = 0
     local db = type(EnemyListDB) == "table" and EnemyListDB or {}
     if db.fadeOutOfCombat then
       f:Show()
@@ -4658,17 +5338,46 @@ local function enemyListApplyMinimapButtonVisibility()
   end
 end
 
---- Resize tab strip and sort-order buttons to match |cf._elInnerW| (same inner width as scroll content).
+--- Base content width, capped by the **active** tab's scroll (when it reports a sane width) so it never exceeds the real child.
+--- Hidden tabs often return 0; child-specific code must also do |min(base, parent:GetWidth())| per control row.
+local function configFrameContentInnerForLayout(cf)
+  cf = cf or configFrame
+  if not cf then
+    return 300
+  end
+  local base = cf._elInnerW
+  if not base and cf._elScrollChild then
+    base = cf._elScrollChild:GetWidth()
+  end
+  base = base or 300
+  if cf._elActiveScrollChild and cf._elActiveScrollChild.GetWidth then
+    local w = cf._elActiveScrollChild:GetWidth()
+    if w and w > 32 then
+      return math.min(base, w)
+    end
+  end
+  return base
+end
+
+--- |min| of layout base and a specific scroll child (e.g. Appearance = |_elScrollChild|) so a row never exceeds its pane.
+local function minInnerForScrollW(base, sc)
+  if not sc or not sc.GetWidth then
+    return base
+  end
+  local w = sc:GetWidth()
+  if w and w > 32 and base then
+    return math.min(base, w)
+  end
+  return base
+end
+
+--- Resize tab strip and sort-order buttons to match the **Appearance** scroll (sort row is on |_elScrollChild| only).
 local function layoutConfigTabsAndSortRow(cf)
   cf = cf or configFrame
   if not cf then
     return
   end
-  local inner = cf._elInnerW
-  if not inner and cf._elScrollChild then
-    inner = cf._elScrollChild:GetWidth()
-  end
-  inner = inner or 300
+  local inner = minInnerForScrollW(configFrameContentInnerForLayout(cf), cf._elScrollChild)
   local sbW = cf._elResizeSbW or 20
   local sbGap = cf._elResizeSbGap or 4
   local tabTotalW = math.max(200, math.floor(inner + sbW + sbGap + 0.5))
@@ -4696,16 +5405,98 @@ local function layoutConfigTabsAndSortRow(cf)
     if n > 0 then
       local btnGap = 2
       local leftPad = 4
-      local usable = inner - leftPad * 2 - (n - 1) * btnGap
-      local btnW = math.max(44, math.floor(usable / n))
+      local gaps = (n - 1) * btnGap
+      local usable = inner - leftPad * 2 - gaps
+      local btnW = math.max(1, math.floor(usable / n))
+      if 2 * leftPad + n * btnW + gaps > inner then
+        btnW = math.max(1, math.floor((inner - 2 * leftPad - gaps) / n))
+      end
       for j, btn in ipairs(cf._elSortBtns) do
         if btn and btn.SetSize and btn.SetPoint then
           btn:SetSize(btnW, 20)
           btn:ClearAllPoints()
           btn:SetPoint("TOPLEFT", cf._elSortRow, "TOPLEFT", leftPad + (j - 1) * (btnW + btnGap), -14)
+          local fs = btn.GetFontString and btn:GetFontString()
+          if fs and fs.SetWidth and fs.SetJustifyH then
+            fs:SetWidth(math.max(4, btnW - 6))
+            fs:SetJustifyH("CENTER")
+          end
         end
       end
+      if cf._elSortRow.SetClipsChildren then
+        pcall(function()
+          cf._elSortRow:SetClipsChildren(true)
+        end)
+      end
     end
+  end
+end
+
+--- Re-layout HP / mana / name "tab" pickers in Party + Raid panels (4- or 3-wide buttons) when |inner| changes.
+--- Each |row| is parented to a tab scroll child; a **hidden** tab can report 0 from |GetWidth| — use |_elInnerW| then.
+local function layoutConfigPositionButtonRows(cf)
+  cf = cf or configFrame
+  if not cf or not cf._elConfigPositionRows then
+    return
+  end
+  local W = EnemyList.ConfigWidgets
+  local baseW = configFrameContentInnerForLayout(cf)
+  for _, row in ipairs(cf._elConfigPositionRows) do
+    if row and type(row._btns) == "table" and row.SetWidth then
+      local n = #row._btns
+      local parent = row.GetParent and row:GetParent()
+      local pw
+      if parent and parent.GetWidth then
+        pw = parent:GetWidth()
+      end
+      local wuse = baseW
+      if pw and pw > 32 then
+        wuse = math.min(baseW, pw)
+      end
+      local rowW = math.max(60, wuse)
+      if n > 0 and rowW > 60 then
+        W.LayoutStyleButtonRow(row, rowW, n)
+      end
+    end
+  end
+end
+
+--- Colors tab: every label+swatch row is |innerW-16| (8px side pad) at build; widen on resize.
+local function layoutConfigColorSwatchRows(cf)
+  cf = cf or configFrame
+  if not cf or not cf._elConfigColorSwatchRows then
+    return
+  end
+  local sc4 = cf._elTabScrollChildren and cf._elTabScrollChildren[4]
+  local inner = minInnerForScrollW(configFrameContentInnerForLayout(cf), sc4)
+  if cf._elColorsTopMark and cf._elColorsTopMark.SetWidth then
+    cf._elColorsTopMark:SetWidth(inner)
+  end
+  local rw = math.max(120, inner - 16)
+  for _, row in ipairs(cf._elConfigColorSwatchRows) do
+    if row and row.SetWidth then
+      row:SetWidth(rw)
+    end
+  end
+end
+
+--- Raid tab: top marker + load button stretch with |inner|.
+local function layoutConfigRaidTabChrome(cf)
+  cf = cf or configFrame
+  local sc6 = cf._elTabScrollChildren and cf._elTabScrollChildren[6]
+  local inner = minInnerForScrollW(configFrameContentInnerForLayout(cf), sc6)
+  local p = cf._elRaidTopMark and cf._elRaidTopMark.GetParent and cf._elRaidTopMark:GetParent()
+  if p and p.GetWidth then
+    local w = p:GetWidth()
+    if w and w > 32 then
+      inner = math.min(inner, w)
+    end
+  end
+  if cf._elRaidTopMark and cf._elRaidTopMark.SetWidth then
+    cf._elRaidTopMark:SetWidth(inner)
+  end
+  if cf._elRaidLoadBtn and cf._elRaidLoadBtn.SetWidth and cf._elRaidLoadBtn.SetHeight then
+    cf._elRaidLoadBtn:SetSize(math.min(340, math.max(150, inner - 24)), 26)
   end
 end
 
@@ -4721,7 +5512,12 @@ local function syncConfigInnerLayout(cf)
   local newInner = math.floor(w - pad * 2 - sbW - sbGap + 0.5)
   newInner = math.max(260, newInner)
   cf._elInnerW = newInner
-  cf._elScrollChild:SetWidth(newInner)
+  --- All tab panes (Appearance + every secondary scroll child) need the new inner width or controls stay narrow.
+  for _, sc in ipairs(cf._elTabScrollChildren or { cf._elScrollChild }) do
+    if sc and sc.SetWidth then
+      sc:SetWidth(newInner)
+    end
+  end
   if cf._elScrollTopMark then
     cf._elScrollTopMark:SetWidth(newInner)
   end
@@ -4735,15 +5531,50 @@ local function syncConfigInnerLayout(cf)
       fr:SetWidth(newInner)
     end
   end
-  if cf._elTestHint then
-    cf._elTestHint:SetWidth(newInner - 28)
-  end
+  --- Re-run slider layout so value column (px / %) has room after width change (Party/Raid use |_elDisplaySliders|).
   if layoutConfigOptionSliderColumns then
     layoutConfigOptionSliderColumns(cf)
   end
+  if cf._elTestHint then
+    cf._elTestHint:SetWidth(newInner - 28)
+  end
+  --- Word-wrapped help text: width was fixed at build time from |innerW|; widen when the window is resized.
+  for _, p in ipairs({
+    { "_elColorsDesc", 12 },
+    { "_elProfDesc", 12 },
+    { "_elSavedHint", 12 },
+    { "_elRaidDesc", 12 },
+    { "_elRaidNote", 12 },
+    { "_elPartyPanelDesc", 12 },
+    { "_elRaidPanelDesc", 12 },
+  }) do
+    local fs = cf[p[1]]
+    if fs and fs.SetWidth then
+      fs:SetWidth(math.max(120, newInner - p[2]))
+    end
+  end
+  if cf._elCliqueTopMark and cf._elCliqueTopMark.SetWidth then
+    cf._elCliqueTopMark:SetWidth(newInner)
+  end
+  if cf._elKeybindsBodyFs and cf._elKeybindsBodyFs.SetWidth then
+    cf._elKeybindsBodyFs:SetWidth(math.max(120, newInner - 16))
+  end
   layoutConfigTabsAndSortRow(cf)
+  layoutConfigPositionButtonRows(cf)
+  layoutConfigColorSwatchRows(cf)
+  if cf._elLayoutProfilesTab then
+    cf._elLayoutProfilesTab()
+  end
+  layoutConfigRaidTabChrome(cf)
   if cf._elSyncScroll then
     cf._elSyncScroll()
+  end
+  if cf._elResizeAppearanceScroll and (not cf.IsShown or cf:IsShown()) and C_Timer and C_Timer.After then
+    C_Timer.After(0, function()
+      if cf and cf._elResizeAppearanceScroll and (not cf.IsShown or cf:IsShown()) then
+        cf._elResizeAppearanceScroll()
+      end
+    end)
   end
 end
 
@@ -4832,6 +5663,15 @@ function refreshConfigFieldsFromDB(cf)
   if cf._elNameplateThreatCheck then
     cf._elNameplateThreatCheck:SetChecked(EnemyListDB.nameplateThreatOverlay and true or false)
   end
+  if cf._elNameplateMirrorCheck then
+    cf._elNameplateMirrorCheck:SetChecked(EnemyListDB.nameplateListMirror and true or false)
+  end
+  if cf._elNameplateThreatSecondCheck then
+    cf._elNameplateThreatSecondCheck:SetChecked(EnemyListDB.nameplateThreatSecondStyle and true or false)
+  end
+  if cf._elSecondThreatAggroCheck then
+    cf._elSecondThreatAggroCheck:SetChecked(EnemyListDB.listShowSecondInAggroSection and true or false)
+  end
   if cf._elFontSlider and cf._elFontSlider.setValueSilent then
     cf._elFontSlider:setValueSilent(EnemyListDB.fontPreset or defaults.fontPreset)
   end
@@ -4861,6 +5701,9 @@ function refreshConfigFieldsFromDB(cf)
   end
   if cf._elThreatBarHSlider and cf._elThreatBarHSlider.setValueSilent then
     cf._elThreatBarHSlider:setValueSilent(tonumber(EnemyListDB.threatBarHeight) or defaults.threatBarHeight)
+  end
+  if cf._elSecondOnThreatBarCheck then
+    cf._elSecondOnThreatBarCheck:SetChecked(EnemyListDB.showSecondOnThreatBar ~= false)
   end
   if cf._elRunnerUpCheck then
     cf._elRunnerUpCheck:SetChecked(EnemyListDB.showRunnerUpBars == true)
@@ -4939,6 +5782,24 @@ function refreshConfigFieldsFromDB(cf)
     end
     if panel.partySelfCountCheck       then panel.partySelfCountCheck:SetChecked(rBool("showSelfAggroCount", false)) end
     if panel.incHealCheck              then panel.incHealCheck:SetChecked(rBool("partyShowIncomingHeals", true)) end
+    if panel.petCheck                  then panel.petCheck:SetChecked(rBool("partyShowPets", false)) end
+    if panel.playerBuffsCheck          then panel.playerBuffsCheck:SetChecked(rBool("partyShowPlayerBuffs", false)) end
+    if panel.playerBuffSlotsSlider and panel.playerBuffSlotsSlider.setValueSilent then
+      panel.playerBuffSlotsSlider:setValueSilent(tonumber(_EL.profileRead(pn, "partyPlayerBuffSlotCount")) or defaults.partyPlayerBuffSlotCount)
+    end
+    if panel.playerBuffSizeSlider and panel.playerBuffSizeSlider.setValueSilent then
+      panel.playerBuffSizeSlider:setValueSilent(tonumber(_EL.profileRead(pn, "partyPlayerBuffIconSize")) or defaults.partyPlayerBuffIconSize)
+    end
+    if panel.playerBuffMaxDurSlider and panel.playerBuffMaxDurSlider.setValueSilent then
+      panel.playerBuffMaxDurSlider:setValueSilent(tonumber(_EL.profileRead(pn, "partyPlayerBuffMaxDuration")) or defaults.partyPlayerBuffMaxDuration)
+    end
+    if panel.playerBuffPosRefresh then panel.playerBuffPosRefresh() end
+    if panel.playerBuffOffsetXSlider and panel.playerBuffOffsetXSlider.setValueSilent then
+      panel.playerBuffOffsetXSlider:setValueSilent(tonumber(_EL.profileRead(pn, "partyPlayerBuffOffsetX")) or 0)
+    end
+    if panel.playerBuffOffsetYSlider and panel.playerBuffOffsetYSlider.setValueSilent then
+      panel.playerBuffOffsetYSlider:setValueSilent(tonumber(_EL.profileRead(pn, "partyPlayerBuffOffsetY")) or 0)
+    end
     if panel.partyManaCheck            then panel.partyManaCheck:SetChecked(rBool("showPartyManaBars", true)) end
     if panel.partyManaHeightSlider and panel.partyManaHeightSlider.setValueSilent then
       panel.partyManaHeightSlider:setValueSilent(tonumber(_EL.profileRead(pn, "partyManaBarHeight")) or defaults.partyManaBarHeight)
@@ -5047,6 +5908,21 @@ local function saveConfigFields(cf)
       EnemyList.RefreshNameplateThreatOverlays(true)
     end
   end
+  if cf._elNameplateMirrorCheck then
+    EnemyListDB.nameplateListMirror = cf._elNameplateMirrorCheck:GetChecked() and true or false
+    if type(EnemyList.RefreshNameplateListMirrors) == "function" then
+      EnemyList.RefreshNameplateListMirrors(true)
+    end
+  end
+  if cf._elNameplateThreatSecondCheck then
+    EnemyListDB.nameplateThreatSecondStyle = cf._elNameplateThreatSecondCheck:GetChecked() and true or false
+    if type(EnemyList.RefreshNameplateThreatOverlays) == "function" then
+      EnemyList.RefreshNameplateThreatOverlays(true)
+    end
+  end
+  if cf._elSecondThreatAggroCheck then
+    EnemyListDB.listShowSecondInAggroSection = cf._elSecondThreatAggroCheck:GetChecked() and true or false
+  end
   if cf._elFontSlider then
     EnemyListDB.fontPreset = math.min(FONT_PRESET_MAX, math.max(2, math.floor(cf._elFontSlider:GetValue() + 0.5)))
   end
@@ -5073,6 +5949,9 @@ local function saveConfigFields(cf)
   end
   if cf._elThreatBarHSlider then
     EnemyListDB.threatBarHeight = math.max(3, math.min(20, math.floor(cf._elThreatBarHSlider:GetValue() + 0.5)))
+  end
+  if cf._elSecondOnThreatBarCheck then
+    EnemyListDB.showSecondOnThreatBar = cf._elSecondOnThreatBarCheck:GetChecked() and true or false
   end
   if cf._elCastBarCheck then
     EnemyListDB.showCastBar = cf._elCastBarCheck:GetChecked() and true or false
@@ -5124,28 +6003,9 @@ local function saveConfigFields(cf)
   layoutRows()
 end
 
---- Works for named or unnamed UICheckButtonTemplate buttons.
+--- Works for named or unnamed UICheckButtonTemplate buttons (shares |SetBooleanLabel| in config widgets).
 local function setCheckButtonLabel(btn, text)
-  if btn.Text and btn.Text.SetText then
-    btn.Text:SetText(text)
-    return btn.Text
-  end
-  local name = btn:GetName()
-  if name then
-    local fs = _G[name .. "Text"]
-    if fs and fs.SetText then
-      fs:SetText(text)
-      return fs
-    end
-  end
-  local n = select("#", btn:GetRegions())
-  for i = 1, n do
-    local r = select(i, btn:GetRegions())
-    if r.GetObjectType and r:GetObjectType() == "FontString" then
-      r:SetText(text)
-      return r
-    end
-  end
+  return EnemyList.ConfigWidgets and EnemyList.ConfigWidgets.SetBooleanLabel(btn, text)
 end
 
 local function styleConfigEditBox(eb, w, h)
@@ -5170,186 +6030,9 @@ end
 
 layoutConfigSpellRows = nil
 
---- Two-column table row: [ label (right-aligned) ] [ slider … value ]
---- High-contrast track + thumb so sliders read clearly on dark config chrome.
+--- Sliders: |EnemyListConfigWidgets.CreateOptionSlider| + |LayoutOptionSliderRow|.
 local function createConfigOptionSlider(row, opts)
-  local labelText = opts.label or ""
-  local tooltip = opts.tooltip
-  local minV = opts.min or 0
-  local maxV = opts.max or 1
-  local step = opts.step or 1
-  local isInt = opts.integer ~= false
-  local formatVal = opts.format or tostring
-  local onChange = opts.onChange
-  --- When set, onChange must not write SavedVariables until gate returns true (slider fires during build before DB sync).
-  local dbWriteGate = opts.dbWriteGate
-  local rowInner = opts.rowInnerWidth or 300
-  local LABEL_LEFT_PAD = 8
-  local COL_GAP = 12
-  local VALUE_W = 52
-  local VALUE_RIGHT_PAD = 8
-  local labelColW = opts.labelColWidth
-  if not labelColW then
-    labelColW = math.min(240, math.max(128, math.floor(rowInner * 0.36)))
-  end
-
-  --- Third arg must be a font name string; passing a FontObject errors on some clients.
-  local labelFontName = _G.GameFontNormal and "GameFontNormal" or "GameFontNormalSmall"
-  local lbl = row:CreateFontString(nil, "OVERLAY", labelFontName)
-  lbl:SetPoint("LEFT", row, "LEFT", LABEL_LEFT_PAD, 0)
-  lbl:SetWidth(labelColW)
-  lbl:SetJustifyH("RIGHT")
-  lbl:SetTextColor(0.9, 0.92, 0.96)
-  lbl:SetShadowColor(0, 0, 0, 1)
-  lbl:SetShadowOffset(1, -1)
-  lbl:SetText(labelText)
-
-  local valFontName = _G.GameFontHighlightSmall and "GameFontHighlightSmall" or "GameFontNormalSmall"
-  local valFs = row:CreateFontString(nil, "OVERLAY", valFontName)
-  valFs:SetPoint("RIGHT", row, "RIGHT", -VALUE_RIGHT_PAD, 0)
-  valFs:SetWidth(VALUE_W)
-  valFs:SetJustifyH("RIGHT")
-  valFs:SetTextColor(0.62, 0.86, 1)
-  valFs:SetShadowColor(0, 0, 0, 1)
-  valFs:SetShadowOffset(1, -1)
-
-  local trackBd = (type(BackdropTemplateMixin) == "table") and "BackdropTemplate" or nil
-  local trackFrame = CreateFrame("Frame", nil, row, trackBd)
-  trackFrame:SetFrameLevel((row:GetFrameLevel() or 0) + 2)
-  trackFrame:SetHeight(24)
-  trackFrame:SetPoint("LEFT", row, "LEFT", LABEL_LEFT_PAD + labelColW + COL_GAP, 0)
-  trackFrame:SetPoint("RIGHT", valFs, "LEFT", -10, 0)
-  if trackFrame.SetBackdrop then
-    pcall(function()
-      trackFrame:SetBackdrop({
-        bgFile = "Interface\\Buttons\\WHITE8X8",
-        edgeFile = "Interface\\Buttons\\WHITE8X8",
-        tile = false,
-        edgeSize = 1,
-        insets = { left = 1, right = 1, top = 1, bottom = 1 },
-      })
-      trackFrame:SetBackdropColor(0.14, 0.15, 0.18, 0.98)
-      trackFrame:SetBackdropBorderColor(0.42, 0.48, 0.56, 0.75)
-    end)
-  end
-
-  --- Do not pass a 4th arg here: it is |template|, not sublevel — |-1| aborts creation on many builds.
-  local groove = trackFrame:CreateTexture(nil, "ARTWORK")
-  groove:SetColorTexture(0.06, 0.07, 0.09, 1)
-  groove:SetPoint("TOPLEFT", trackFrame, "TOPLEFT", 8, -8)
-  groove:SetPoint("BOTTOMRIGHT", trackFrame, "BOTTOMRIGHT", -8, 8)
-
-  local slider = CreateFrame("Slider", nil, trackFrame)
-  slider:SetFrameLevel(trackFrame:GetFrameLevel() + 3)
-  pcall(function()
-    slider:SetOrientation("HORIZONTAL")
-  end)
-  slider:EnableMouse(true)
-  slider:ClearAllPoints()
-  --- Nearly fill the track so drags register across the full bar (track has no mouse).
-  slider:SetPoint("TOPLEFT", trackFrame, "TOPLEFT", 2, -1)
-  slider:SetPoint("BOTTOMRIGHT", trackFrame, "BOTTOMRIGHT", -2, 1)
-
-  local thumb = slider:CreateTexture(nil, "OVERLAY")
-  thumb:SetTexture("Interface\\Buttons\\WHITE8X8")
-  thumb:SetSize(14, 20)
-  thumb:SetVertexColor(0.5, 0.78, 1, 1)
-  local okThumb = pcall(function()
-    slider:SetThumbTexture(thumb)
-  end)
-  if not okThumb then
-    pcall(function()
-      slider:SetThumbTexture("Interface\\Buttons\\UI-SliderBar-Button-Horizontal")
-    end)
-  end
-
-  slider:SetMinMaxValues(minV, maxV)
-  slider:SetValueStep(step)
-  if slider.SetObeyStepOnDrag then
-    pcall(function()
-      slider:SetObeyStepOnDrag(true)
-    end)
-  end
-
-  slider._elLabelFs = lbl
-  slider._elRow = row
-  slider._elValueFs = valFs
-  slider._elTrackFrame = trackFrame
-  slider._elGrooveTex = groove
-
-  local function snap(v)
-    if isInt then
-      return math.max(minV, math.min(maxV, math.floor(v + 0.5)))
-    end
-    local st = step > 0 and step or 0.01
-    local snapped = math.floor(v / st + 0.5) * st
-    if snapped < minV then
-      snapped = minV
-    end
-    if snapped > maxV then
-      snapped = maxV
-    end
-    return snapped
-  end
-
-  slider:SetScript("OnValueChanged", function(self, raw)
-    if self._elIgnore then
-      return
-    end
-    local v = snap(raw)
-    if math.abs(v - raw) > 1e-4 then
-      self._elIgnore = true
-      self:SetValue(v)
-      self._elIgnore = false
-    end
-    valFs:SetText(formatVal(v))
-    if onChange and (not dbWriteGate or dbWriteGate()) then
-      onChange(v)
-    end
-  end)
-
-  slider._elThumbTex = thumb
-  local function sliderShowTooltip(self)
-    if tooltip and tooltip ~= "" then
-      GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
-      GameTooltip:SetText(tooltip, nil, nil, nil, nil, true)
-      GameTooltip:Show()
-    end
-  end
-  local function sliderOnEnter(self)
-    if thumb and thumb.SetVertexColor then
-      thumb:SetVertexColor(0.82, 0.94, 1, 1)
-    end
-    if trackFrame.SetBackdropBorderColor then
-      pcall(function()
-        trackFrame:SetBackdropBorderColor(0.55, 0.68, 0.88, 0.9)
-      end)
-    end
-    sliderShowTooltip(self)
-  end
-  local function sliderOnLeave()
-    if thumb and thumb.SetVertexColor then
-      thumb:SetVertexColor(0.5, 0.78, 1, 1)
-    end
-    if trackFrame.SetBackdropBorderColor then
-      pcall(function()
-        trackFrame:SetBackdropBorderColor(0.42, 0.48, 0.56, 0.75)
-      end)
-    end
-    GameTooltip_Hide()
-  end
-  slider:SetScript("OnEnter", sliderOnEnter)
-  slider:SetScript("OnLeave", sliderOnLeave)
-
-  function slider:setValueSilent(v)
-    v = snap(v)
-    self._elIgnore = true
-    self:SetValue(v)
-    self._elIgnore = false
-    valFs:SetText(formatVal(v))
-  end
-
-  return slider
+  return EnemyList.ConfigWidgets.CreateOptionSlider(row, opts)
 end
 
 layoutConfigOptionSliderColumns = function(cf)
@@ -5357,54 +6040,20 @@ layoutConfigOptionSliderColumns = function(cf)
   if not cf or not cf._elDisplaySliders then
     return
   end
-  local inner = cf._elInnerW
-  if not inner and cf._elScrollChild then
-    inner = cf._elScrollChild:GetWidth()
-  end
-  inner = inner or 300
-  local leftPad = 8
-  local gap = 12
-  local valW = 52
-  local valPad = 8
-  --- Keep the label column from eating horizontal growth so widening the config window widens slider tracks.
-  local labelW = math.min(168, math.max(108, math.floor(inner * 0.22)))
+  local W = EnemyList.ConfigWidgets
+  local baseW = configFrameContentInnerForLayout(cf)
   for _, slider in ipairs(cf._elDisplaySliders) do
     if slider and slider._elRow and slider._elLabelFs then
       local row = slider._elRow
-      local lbl = slider._elLabelFs
-      local valFs = slider._elValueFs
-      local track = slider._elTrackFrame
-      lbl:ClearAllPoints()
-      lbl:SetWidth(labelW)
-      lbl:SetPoint("LEFT", row, "LEFT", leftPad, 0)
-      lbl:SetJustifyH("RIGHT")
-      if valFs then
-        valFs:ClearAllPoints()
-        valFs:SetWidth(valW)
-        valFs:SetPoint("RIGHT", row, "RIGHT", -valPad, 0)
-      end
-      if track then
-        track:ClearAllPoints()
-        track:SetHeight(24)
-        track:SetPoint("LEFT", row, "LEFT", leftPad + labelW + gap, 0)
-        if valFs then
-          track:SetPoint("RIGHT", valFs, "LEFT", -10, 0)
-        else
-          track:SetPoint("RIGHT", row, "RIGHT", -valPad, 0)
-        end
-        slider:ClearAllPoints()
-        slider:SetPoint("TOPLEFT", track, "TOPLEFT", 2, -1)
-        slider:SetPoint("BOTTOMRIGHT", track, "BOTTOMRIGHT", -2, 1)
-      else
-        slider:ClearAllPoints()
-        slider:SetHeight(20)
-        slider:SetPoint("LEFT", row, "LEFT", leftPad + labelW + gap, 0)
-        if valFs then
-          slider:SetPoint("RIGHT", valFs, "LEFT", -8, 0)
-        else
-          slider:SetPoint("RIGHT", row, "RIGHT", -valPad, 0)
+      local inner = baseW
+      local p = row and row.GetParent and row:GetParent()
+      if p and p.GetWidth then
+        local pw = p:GetWidth()
+        if pw and pw > 32 then
+          inner = math.min(baseW, pw)
         end
       end
+      W.LayoutOptionSliderRow(slider, inner)
     end
   end
 end
@@ -5453,7 +6102,8 @@ local function createConfigFrame()
   local sbGap = 4
   local innerW = cfgW - pad * 2 - sbW - sbGap
   local lineTrim = 8
-  local contentH = 1400
+  --- Floor only; |_elResizeAppearanceScroll| sets the true height after layout (avoids huge empty scroll).
+  local contentH = 1500
   local editBackdropTmpl = (type(BackdropTemplateMixin) == "table") and "BackdropTemplate" or nil
   --- Sibling frame levels: background lowest (drawn behind UI); controls above.
   local zBg = 1
@@ -5500,6 +6150,17 @@ local function createConfigFrame()
   configFrame:SetScript("OnShow", function(self)
     if self._elSyncScroll then
       self._elSyncScroll()
+    end
+    if self._elResizeAppearanceScroll then
+      if C_Timer and C_Timer.After then
+        C_Timer.After(0, function()
+          if self._elResizeAppearanceScroll then
+            self._elResizeAppearanceScroll()
+          end
+        end)
+      else
+        self._elResizeAppearanceScroll()
+      end
     end
     if self.Raise then
       self:Raise()
@@ -5587,10 +6248,8 @@ local function createConfigFrame()
   pcall(function()
     --- Parent must be a ScrollFrame: UIPanelScrollBarTemplate / SecureScrollTemplates wire
     --- internal scripts (up/down buttons, mouse wheel) that call |self:GetParent():SetVerticalScroll(...)|.
-    --- If the parent is a plain Frame (configFrame) that call blows up as "attempt to call method
-    --- 'SetVerticalScroll' (a nil value)" — seen in raid because the raid frame's own secure
-    --- scroll runs the same template more aggressively. Our own OnValueChanged handler below still
-    --- routes to whichever tab's scroll frame is active.
+    --- |syncScrollBounds| re-parents this bar to |_elActiveScrollFrame| so it stays visible when
+    --- non-Appearance tabs hide the first |ScrollFrame|; do not set parent to |configFrame| only.
     scrollBar = CreateFrame("Slider", nil, scrollFrame, "UIPanelScrollBarTemplate")
     scrollBar:SetPoint("TOPLEFT", scrollFrame, "TOPRIGHT", sbGap, -16)
     scrollBar:SetPoint("BOTTOMLEFT", scrollFrame, "BOTTOMRIGHT", sbW + sbGap, 2)
@@ -5618,6 +6277,18 @@ local function createConfigFrame()
     if not sf or not sc then
       return
     end
+    --- The bar was created on the first tab's |ScrollFrame|; other tabs |Hide()| that frame, which hid the
+    --- bar for every page. Re-parent the template slider to the **active** |ScrollFrame| (still a valid
+    --- |SetVerticalScroll| target for |UIPanelScrollBarTemplate|).
+    if scrollBar and sf and scrollBar.SetParent and (not scrollBar.GetParent or scrollBar:GetParent() ~= sf) then
+      local gap = configFrame._elResizeSbGap or 4
+      local sbb = configFrame._elResizeSbW or 20
+      scrollBar:SetParent(sf)
+      scrollBar:ClearAllPoints()
+      scrollBar:SetPoint("TOPLEFT", sf, "TOPRIGHT", gap, -16)
+      scrollBar:SetPoint("BOTTOMLEFT", sf, "BOTTOMRIGHT", sbb + gap, 2)
+      scrollBar:SetFrameLevel((sf:GetFrameLevel() or 0) + 20)
+    end
     local viewH = sf:GetHeight()
     if not viewH or viewH < 1 then
       viewH = 1
@@ -5628,7 +6299,7 @@ local function createConfigFrame()
     if scrollBar then
       scrollBarUpdating = true
       scrollBar:SetMinMaxValues(0, range)
-      if range < 2 then
+      if range < 0.5 then
         scrollBar:Hide()
       else
         scrollBar:Show()
@@ -5688,40 +6359,30 @@ local function createConfigFrame()
   configFrame._elScrollTopMark = scrollTopMark
   local secDisp, secDispLine = addConfigSectionHeader(scrollChild, scrollTopMark, -6, L.CONFIG_SECTION_DISPLAY, nil, innerW - lineTrim)
   configFrame._elSectionLines = { secDispLine }
+  local Wb = EnemyList.ConfigWidgets
 
-  local compactCheck = CreateFrame("CheckButton", nil, scrollChild, "UICheckButtonTemplate")
-  compactCheck:SetPoint("TOPLEFT", secDisp, "BOTTOMLEFT", 0, -12)
-  local compactText = setCheckButtonLabel(compactCheck, L.OPT_COMPACT_ROW)
-  if compactText then
-    compactText:SetTextColor(0.85, 0.87, 0.90)
-  end
-  compactCheck:SetScript("OnClick", function(self)
-    EnemyListDB.compactRow = self:GetChecked() and true or false
-    layoutRows()
-  end)
-  compactCheck:SetScript("OnEnter", function()
-    GameTooltip:SetOwner(compactCheck, "ANCHOR_RIGHT")
-    GameTooltip:SetText(L.TOOLTIP_OPT_COMPACT_ROW, nil, nil, nil, nil, true)
-    GameTooltip:Show()
-  end)
-  compactCheck:SetScript("OnLeave", GameTooltip_Hide)
+  local compactCheck = Wb.CreateBooleanOption(scrollChild, {
+    placeAfter = secDisp,
+    offsetY = -12,
+    text = L.OPT_COMPACT_ROW,
+    textColor = { 0.85, 0.87, 0.90 },
+    onClick = function(self)
+      EnemyListDB.compactRow = self:GetChecked() and true or false
+      layoutRows()
+    end,
+    tooltip = L.TOOLTIP_OPT_COMPACT_ROW,
+  })
 
-  local truncateNamesCheck = CreateFrame("CheckButton", nil, scrollChild, "UICheckButtonTemplate")
-  truncateNamesCheck:SetPoint("TOPLEFT", compactCheck, "BOTTOMLEFT", 0, -4)
-  local truncateNamesText = setCheckButtonLabel(truncateNamesCheck, L.OPT_TRUNCATE_NAMES)
-  if truncateNamesText then
-    truncateNamesText:SetTextColor(0.85, 0.87, 0.90)
-  end
-  truncateNamesCheck:SetScript("OnClick", function(self)
-    EnemyListDB.truncateLongNames = self:GetChecked() and true or false
-    layoutRows()
-  end)
-  truncateNamesCheck:SetScript("OnEnter", function()
-    GameTooltip:SetOwner(truncateNamesCheck, "ANCHOR_RIGHT")
-    GameTooltip:SetText(L.TOOLTIP_OPT_TRUNCATE_NAMES, nil, nil, nil, nil, true)
-    GameTooltip:Show()
-  end)
-  truncateNamesCheck:SetScript("OnLeave", GameTooltip_Hide)
+  local truncateNamesCheck = Wb.CreateBooleanOption(scrollChild, {
+    placeAfter = compactCheck,
+    text = L.OPT_TRUNCATE_NAMES,
+    textColor = { 0.85, 0.87, 0.90 },
+    onClick = function(self)
+      EnemyListDB.truncateLongNames = self:GetChecked() and true or false
+      layoutRows()
+    end,
+    tooltip = L.TOOLTIP_OPT_TRUNCATE_NAMES,
+  })
   configFrame._elTruncateNamesCheck = truncateNamesCheck
 
   local maxNameLenRow = CreateFrame("Frame", nil, scrollChild)
@@ -5747,56 +6408,38 @@ local function createConfigFrame()
   })
   configFrame._elMaxNameLenSlider = maxNameLenSlider
 
-  local bgCheck = CreateFrame("CheckButton", nil, scrollChild, "UICheckButtonTemplate")
-  bgCheck:SetPoint("TOPLEFT", maxNameLenRow, "BOTTOMLEFT", 0, -4)
-  local bgText = setCheckButtonLabel(bgCheck, L.OPT_SHOW_BG)
-  if bgText then
-    bgText:SetTextColor(0.85, 0.87, 0.90)
-  end
-  bgCheck:SetScript("OnClick", function(self)
-    EnemyListDB.showBackground = self:GetChecked() and true or false
-    applyMainBackground()
-  end)
-  bgCheck:SetScript("OnEnter", function()
-    GameTooltip:SetOwner(bgCheck, "ANCHOR_RIGHT")
-    GameTooltip:SetText(L.TOOLTIP_OPT_SHOW_BG, nil, nil, nil, nil, true)
-    GameTooltip:Show()
-  end)
-  bgCheck:SetScript("OnLeave", GameTooltip_Hide)
+  local bgCheck = Wb.CreateBooleanOption(scrollChild, {
+    placeAfter = maxNameLenRow,
+    text = L.OPT_SHOW_BG,
+    textColor = { 0.85, 0.87, 0.90 },
+    onClick = function(self)
+      EnemyListDB.showBackground = self:GetChecked() and true or false
+      applyMainBackground()
+    end,
+    tooltip = L.TOOLTIP_OPT_SHOW_BG,
+  })
 
-  local singleColCheck = CreateFrame("CheckButton", nil, scrollChild, "UICheckButtonTemplate")
-  singleColCheck:SetPoint("TOPLEFT", bgCheck, "BOTTOMLEFT", 0, -4)
-  local singleColText = setCheckButtonLabel(singleColCheck, L.OPT_SINGLE_COL)
-  if singleColText then
-    singleColText:SetTextColor(0.85, 0.87, 0.90)
-  end
-  singleColCheck:SetScript("OnClick", function(self)
-    EnemyListDB.singleColumn = self:GetChecked() and true or false
-    layoutRows()
-  end)
-  singleColCheck:SetScript("OnEnter", function()
-    GameTooltip:SetOwner(singleColCheck, "ANCHOR_RIGHT")
-    GameTooltip:SetText(L.TOOLTIP_OPT_SINGLE_COL, nil, nil, nil, nil, true)
-    GameTooltip:Show()
-  end)
-  singleColCheck:SetScript("OnLeave", GameTooltip_Hide)
+  local singleColCheck = Wb.CreateBooleanOption(scrollChild, {
+    placeAfter = bgCheck,
+    text = L.OPT_SINGLE_COL,
+    textColor = { 0.85, 0.87, 0.90 },
+    onClick = function(self)
+      EnemyListDB.singleColumn = self:GetChecked() and true or false
+      layoutRows()
+    end,
+    tooltip = L.TOOLTIP_OPT_SINGLE_COL,
+  })
 
-  local gridCheck = CreateFrame("CheckButton", nil, scrollChild, "UICheckButtonTemplate")
-  gridCheck:SetPoint("TOPLEFT", singleColCheck, "BOTTOMLEFT", 0, -4)
-  local gridText = setCheckButtonLabel(gridCheck, L.OPT_GRID_MODE)
-  if gridText then
-    gridText:SetTextColor(0.85, 0.87, 0.90)
-  end
-  gridCheck:SetScript("OnClick", function(self)
-    EnemyListDB.gridMode = self:GetChecked() and true or false
-    layoutRows()
-  end)
-  gridCheck:SetScript("OnEnter", function()
-    GameTooltip:SetOwner(gridCheck, "ANCHOR_RIGHT")
-    GameTooltip:SetText(L.TOOLTIP_OPT_GRID_MODE, nil, nil, nil, nil, true)
-    GameTooltip:Show()
-  end)
-  gridCheck:SetScript("OnLeave", GameTooltip_Hide)
+  local gridCheck = Wb.CreateBooleanOption(scrollChild, {
+    placeAfter = singleColCheck,
+    text = L.OPT_GRID_MODE,
+    textColor = { 0.85, 0.87, 0.90 },
+    onClick = function(self)
+      EnemyListDB.gridMode = self:GetChecked() and true or false
+      layoutRows()
+    end,
+    tooltip = L.TOOLTIP_OPT_GRID_MODE,
+  })
 
   local gridSizeRow = CreateFrame("Frame", nil, scrollChild)
   gridSizeRow:SetSize(innerW, 42)
@@ -5844,53 +6487,15 @@ local function createConfigFrame()
   })
   configFrame._elGridColSlider = gridColSlider
 
-  local npRangeCheck = CreateFrame("CheckButton", nil, scrollChild, "UICheckButtonTemplate")
-  npRangeCheck:SetPoint("TOPLEFT", gridColRow, "BOTTOMLEFT", 0, -4)
-  local npRangeText = setCheckButtonLabel(npRangeCheck, L.OPT_EXTEND_NAMEPLATE_RANGE)
-  if npRangeText then
-    npRangeText:SetTextColor(0.85, 0.87, 0.90)
-  end
-  npRangeCheck:SetScript("OnClick", function(self)
-    EnemyListDB.extendNameplateRange = self:GetChecked() and true or false
-    if EnemyListDB.extendNameplateRange and type(EnemyList.ApplyNameplateRangePreference) == "function" then
-      EnemyList.ApplyNameplateRangePreference()
-    end
-  end)
-  npRangeCheck:SetScript("OnEnter", function()
-    GameTooltip:SetOwner(npRangeCheck, "ANCHOR_RIGHT")
-    GameTooltip:SetText(L.TOOLTIP_OPT_EXTEND_NAMEPLATE_RANGE, nil, nil, nil, nil, true)
-    GameTooltip:Show()
-  end)
-  npRangeCheck:SetScript("OnLeave", GameTooltip_Hide)
-
-  local npThreatCheck = CreateFrame("CheckButton", nil, scrollChild, "UICheckButtonTemplate")
-  npThreatCheck:SetPoint("TOPLEFT", npRangeCheck, "BOTTOMLEFT", 0, -4)
-  local npThreatText = setCheckButtonLabel(npThreatCheck, L.OPT_NAMEPLATE_THREAT)
-  if npThreatText then
-    npThreatText:SetTextColor(0.85, 0.87, 0.90)
-  end
-  npThreatCheck:SetScript("OnClick", function(self)
-    EnemyListDB.nameplateThreatOverlay = self:GetChecked() and true or false
-    if type(EnemyList.RefreshNameplateThreatOverlays) == "function" then
-      EnemyList.RefreshNameplateThreatOverlays(true)
-    end
-  end)
-  npThreatCheck:SetScript("OnEnter", function()
-    GameTooltip:SetOwner(npThreatCheck, "ANCHOR_RIGHT")
-    GameTooltip:SetText(L.TOOLTIP_OPT_NAMEPLATE_THREAT, nil, nil, nil, nil, true)
-    GameTooltip:Show()
-  end)
-  npThreatCheck:SetScript("OnLeave", GameTooltip_Hide)
-
   --- Sort mode selector: row of toggle buttons (single-column and grid mode).
-  local sortLabels = { "Aggro Hi", "Aggro Lo", "HP Hi", "HP Lo" }
+  local sortLabels = { L.SORT_AGGRO_HI, L.SORT_AGGRO_LO, L.SORT_HP_HI, L.SORT_HP_LO }
   local sortRow = CreateFrame("Frame", nil, scrollChild)
   sortRow:SetSize(innerW, 38)
-  sortRow:SetPoint("TOPLEFT", npThreatCheck, "BOTTOMLEFT", 0, -8)
+  sortRow:SetPoint("TOPLEFT", gridColRow, "BOTTOMLEFT", 0, -8)
   local sortTitle = sortRow:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
   sortTitle:SetPoint("TOPLEFT", sortRow, "TOPLEFT", 4, 0)
   sortTitle:SetTextColor(0.74, 0.77, 0.82)
-  sortTitle:SetText("Sort order (single column / grid):")
+  sortTitle:SetText(L.SETUP_SORT_HEADER .. ":")
   local sortBtns = {}
   local btnW = math.floor((innerW - 12) / 4)
   local function updateSortSelection()
@@ -5939,7 +6544,7 @@ local function createConfigFrame()
     end)
     btn:SetScript("OnEnter", function(self)
       GameTooltip:SetOwner(self, "ANCHOR_TOP")
-      GameTooltip:SetText("Sort by: " .. label, nil, nil, nil, nil, true)
+      GameTooltip:SetText(string.format(L.OPT_SORT_BY, label), nil, nil, nil, nil, true)
       GameTooltip:Show()
     end)
     btn:SetScript("OnLeave", GameTooltip_Hide)
@@ -6109,8 +6714,8 @@ local function createConfigFrame()
   hpBarHRow:SetPoint("TOPLEFT", widthRow, "BOTTOMLEFT", 0, -6)
   local hpBarHSlider = createConfigOptionSlider(hpBarHRow, {
     rowInnerWidth = innerW,
-    label = "Health bar height",
-    tooltip = "Height of the health bar in pixels (6–40).",
+    label = L.OPT_ENEMY_LIST_HEALTH_BAR_HEIGHT,
+    tooltip = L.TOOLTIP_OPT_ENEMY_LIST_HEALTH_BAR_HEIGHT,
     min = 6, max = 40, step = 1, integer = true,
     dbWriteGate = configSliderDbGate,
     format = function(v) return tostring(math.floor(v + 0.5)) .. "px" end,
@@ -6121,21 +6726,24 @@ local function createConfigFrame()
   })
 
   --- Threat bar toggle + height.
-  local threatBarCheck = CreateFrame("CheckButton", nil, scrollChild, "UICheckButtonTemplate")
-  threatBarCheck:SetPoint("TOPLEFT", hpBarHRow, "BOTTOMLEFT", 0, -6)
-  local threatBarText = setCheckButtonLabel(threatBarCheck, "Show threat bar")
-  if threatBarText then threatBarText:SetTextColor(0.85, 0.87, 0.90) end
-  threatBarCheck:SetScript("OnClick", function(self)
-    EnemyListDB.showThreatBar = self:GetChecked() and true or false
-    layoutRows()
-  end)
+  local threatBarCheck = Wb.CreateBooleanOption(scrollChild, {
+    placeAfter = hpBarHRow,
+    offsetY = -6,
+    text = L.OPT_DISPLAY_SHOW_THREAT_BAR,
+    textColor = { 0.85, 0.87, 0.90 },
+    onClick = function(self)
+      EnemyListDB.showThreatBar = self:GetChecked() and true or false
+      layoutRows()
+    end,
+    tooltip = L.TOOLTIP_OPT_DISPLAY_SHOW_THREAT_BAR,
+  })
   local threatBarHRow = CreateFrame("Frame", nil, scrollChild)
   threatBarHRow:SetSize(innerW, 42)
   threatBarHRow:SetPoint("TOPLEFT", threatBarCheck, "BOTTOMLEFT", 0, -2)
   local threatBarHSlider = createConfigOptionSlider(threatBarHRow, {
     rowInnerWidth = innerW,
-    label = "Threat bar height",
-    tooltip = "Height of the threat/aggro bar in pixels (3–20).",
+    label = L.OPT_ENEMY_THREAT_BAR_HEIGHT,
+    tooltip = L.TOOLTIP_OPT_ENEMY_THREAT_BAR_HEIGHT,
     min = 3, max = 20, step = 1, integer = true,
     dbWriteGate = configSliderDbGate,
     format = function(v) return tostring(math.floor(v + 0.5)) .. "px" end,
@@ -6145,28 +6753,37 @@ local function createConfigFrame()
     end,
   })
 
+  local secondOnThreatBarCheck = Wb.CreateBooleanOption(scrollChild, {
+    placeAfter = threatBarHRow,
+    offsetY = -6,
+    text = L.OPT_SHOW_SECOND_ON_THREAT_BAR,
+    textColor = { 0.85, 0.87, 0.90 },
+    onClick = function(self)
+      EnemyListDB.showSecondOnThreatBar = self:GetChecked() and true or false
+      layoutRows()
+    end,
+    tooltip = L.TOOLTIP_OPT_SHOW_SECOND_ON_THREAT_BAR,
+  })
+
   --- Runner-up aggro bars — top N non-tanking threats on each enemy row.
-  local runnerUpCheck = CreateFrame("CheckButton", nil, scrollChild, "UICheckButtonTemplate")
-  runnerUpCheck:SetPoint("TOPLEFT", threatBarHRow, "BOTTOMLEFT", 0, -6)
-  local runnerUpText = setCheckButtonLabel(runnerUpCheck, L.OPT_RUNNER_UP_BARS or "Show runner-up aggro bars")
-  if runnerUpText then runnerUpText:SetTextColor(0.85, 0.87, 0.90) end
-  runnerUpCheck:SetScript("OnClick", function(self)
-    EnemyListDB.showRunnerUpBars = self:GetChecked() and true or false
-    layoutRows()
-  end)
-  runnerUpCheck:SetScript("OnEnter", function(s)
-    GameTooltip:SetOwner(s, "ANCHOR_RIGHT")
-    GameTooltip:SetText(L.TOOLTIP_OPT_RUNNER_UP_BARS or "Adds a thin row of bars beneath the threat bar showing the top non-tank threats on each enemy, so you can see how close 2nd / 3rd place is to pulling. Up to 5 bars, color-coded green → yellow → red.", nil, nil, nil, nil, true)
-    GameTooltip:Show()
-  end)
-  runnerUpCheck:SetScript("OnLeave", GameTooltip_Hide)
+  local runnerUpCheck = Wb.CreateBooleanOption(scrollChild, {
+    placeAfter = secondOnThreatBarCheck,
+    offsetY = -6,
+    text = L.OPT_RUNNER_UP_BARS,
+    textColor = { 0.85, 0.87, 0.90 },
+    onClick = function(self)
+      EnemyListDB.showRunnerUpBars = self:GetChecked() and true or false
+      layoutRows()
+    end,
+    tooltip = L.TOOLTIP_OPT_RUNNER_UP_BARS,
+  })
   local runnerUpCountRow = CreateFrame("Frame", nil, scrollChild)
   runnerUpCountRow:SetSize(innerW, 42)
   runnerUpCountRow:SetPoint("TOPLEFT", runnerUpCheck, "BOTTOMLEFT", 0, -2)
   local runnerUpCountSlider = createConfigOptionSlider(runnerUpCountRow, {
     rowInnerWidth = innerW,
-    label = L.OPT_RUNNER_UP_COUNT or "Runner-up slots",
-    tooltip = L.TOOLTIP_OPT_RUNNER_UP_COUNT or "How many threat holders to show, 1–5.",
+    label = L.OPT_RUNNER_UP_COUNT,
+    tooltip = L.TOOLTIP_OPT_RUNNER_UP_COUNT,
     min = 1, max = 5, step = 1, integer = true,
     dbWriteGate = configSliderDbGate,
     format = function(v) return tostring(math.floor(v + 0.5)) end,
@@ -6180,8 +6797,8 @@ local function createConfigFrame()
   runnerUpHeightRow:SetPoint("TOPLEFT", runnerUpCountRow, "BOTTOMLEFT", 0, -2)
   local runnerUpHeightSlider = createConfigOptionSlider(runnerUpHeightRow, {
     rowInnerWidth = innerW,
-    label = L.OPT_RUNNER_UP_HEIGHT or "Runner-up bar height",
-    tooltip = L.TOOLTIP_OPT_RUNNER_UP_HEIGHT or "Thickness of each runner-up bar in pixels (2–16).",
+    label = L.OPT_RUNNER_UP_HEIGHT,
+    tooltip = L.TOOLTIP_OPT_RUNNER_UP_HEIGHT,
     min = 2, max = 16, step = 1, integer = true,
     dbWriteGate = configSliderDbGate,
     format = function(v) return tostring(math.floor(v + 0.5)) .. "px" end,
@@ -6191,22 +6808,37 @@ local function createConfigFrame()
     end,
   })
 
+  local secondThreatAggroCheck = Wb.CreateBooleanOption(scrollChild, {
+    placeAfter = runnerUpHeightRow,
+    offsetY = -6,
+    text = L.OPT_LIST_SECOND_IN_AGGRO,
+    textColor = { 0.85, 0.87, 0.90 },
+    onClick = function(self)
+      EnemyListDB.listShowSecondInAggroSection = self:GetChecked() and true or false
+      layoutRows()
+    end,
+    tooltip = L.TOOLTIP_OPT_LIST_SECOND_IN_AGGRO,
+  })
+
   --- Cast bar toggle + height.
-  local castBarCheck = CreateFrame("CheckButton", nil, scrollChild, "UICheckButtonTemplate")
-  castBarCheck:SetPoint("TOPLEFT", runnerUpHeightRow, "BOTTOMLEFT", 0, -6)
-  local castBarText = setCheckButtonLabel(castBarCheck, "Show cast bar")
-  if castBarText then castBarText:SetTextColor(0.85, 0.87, 0.90) end
-  castBarCheck:SetScript("OnClick", function(self)
-    EnemyListDB.showCastBar = self:GetChecked() and true or false
-    layoutRows()
-  end)
+  local castBarCheck = Wb.CreateBooleanOption(scrollChild, {
+    placeAfter = secondThreatAggroCheck,
+    offsetY = -6,
+    text = L.OPT_DISPLAY_SHOW_CAST_BAR,
+    textColor = { 0.85, 0.87, 0.90 },
+    onClick = function(self)
+      EnemyListDB.showCastBar = self:GetChecked() and true or false
+      layoutRows()
+    end,
+    tooltip = L.TOOLTIP_OPT_DISPLAY_SHOW_CAST_BAR,
+  })
   local castBarHRow = CreateFrame("Frame", nil, scrollChild)
   castBarHRow:SetSize(innerW, 42)
   castBarHRow:SetPoint("TOPLEFT", castBarCheck, "BOTTOMLEFT", 0, -2)
   local castBarHSlider = createConfigOptionSlider(castBarHRow, {
     rowInnerWidth = innerW,
-    label = "Cast bar height",
-    tooltip = "Height of the enemy cast bar in pixels (3–20).",
+    label = L.OPT_ENEMY_LIST_DISPLAY_CAST_BAR_HEIGHT,
+    tooltip = L.TOOLTIP_OPT_ENEMY_LIST_DISPLAY_CAST_BAR_HEIGHT,
     min = 3, max = 20, step = 1, integer = true,
     dbWriteGate = configSliderDbGate,
     format = function(v) return tostring(math.floor(v + 0.5)) .. "px" end,
@@ -6222,87 +6854,78 @@ local function createConfigFrame()
   configFrame._elHpBarHSlider = hpBarHSlider
   configFrame._elThreatBarCheck = threatBarCheck
   configFrame._elThreatBarHSlider = threatBarHSlider
+  configFrame._elSecondOnThreatBarCheck = secondOnThreatBarCheck
   configFrame._elCastBarCheck = castBarCheck
   configFrame._elCastBarHSlider = castBarHSlider
   configFrame._elRunnerUpCheck = runnerUpCheck
   configFrame._elRunnerUpCountSlider = runnerUpCountSlider
   configFrame._elRunnerUpHeightSlider = runnerUpHeightSlider
+  configFrame._elSecondThreatAggroCheck = secondThreatAggroCheck
 
-  local raidMarkerCheck = CreateFrame("CheckButton", nil, scrollChild, "UICheckButtonTemplate")
-  raidMarkerCheck:SetPoint("TOPLEFT", castBarHRow, "BOTTOMLEFT", 0, -6)
-  local raidMarkerText = setCheckButtonLabel(raidMarkerCheck, "Show raid markers")
-  if raidMarkerText then raidMarkerText:SetTextColor(0.85, 0.87, 0.90) end
-  raidMarkerCheck:SetScript("OnClick", function(self)
-    EnemyListDB.showRaidMarkers = self:GetChecked() and true or false
-    layoutRows()
-  end)
+  local raidMarkerCheck = Wb.CreateBooleanOption(scrollChild, {
+    placeAfter = castBarHRow,
+    offsetY = -6,
+    text = L.OPT_DISPLAY_SHOW_RAID_MARKERS,
+    textColor = { 0.85, 0.87, 0.90 },
+    onClick = function(self)
+      EnemyListDB.showRaidMarkers = self:GetChecked() and true or false
+      layoutRows()
+    end,
+    tooltip = L.TOOLTIP_OPT_DISPLAY_SHOW_RAID_MARKERS,
+  })
   configFrame._elRaidMarkerCheck = raidMarkerCheck
 
-  local selfToTCheck = CreateFrame("CheckButton", nil, scrollChild, "UICheckButtonTemplate")
-  selfToTCheck:SetPoint("TOPLEFT", raidMarkerCheck, "BOTTOMLEFT", 0, -4)
-  local selfToTText = setCheckButtonLabel(selfToTCheck, "Show self as target")
-  if selfToTText then selfToTText:SetTextColor(0.85, 0.87, 0.90) end
-  selfToTCheck:SetScript("OnClick", function(self)
-    EnemyListDB.showSelfToT = self:GetChecked() and true or false
-    layoutRows()
-  end)
-  selfToTCheck:SetScript("OnEnter", function(s)
-    GameTooltip:SetOwner(s, "ANCHOR_RIGHT")
-    GameTooltip:SetText("Show a ToT indicator when an enemy is targeting you (not just other party members).", nil, nil, nil, nil, true)
-    GameTooltip:Show()
-  end)
-  selfToTCheck:SetScript("OnLeave", GameTooltip_Hide)
+  local selfToTCheck = Wb.CreateBooleanOption(scrollChild, {
+    placeAfter = raidMarkerCheck,
+    text = L.OPT_DISPLAY_SHOW_SELF_TOT,
+    textColor = { 0.85, 0.87, 0.90 },
+    onClick = function(self)
+      EnemyListDB.showSelfToT = self:GetChecked() and true or false
+      layoutRows()
+    end,
+    tooltip = L.TOOLTIP_OPT_DISPLAY_SHOW_SELF_TOT,
+  })
   configFrame._elSelfToTCheck = selfToTCheck
 
-  local partyCombatCheck = CreateFrame("CheckButton", nil, scrollChild, "UICheckButtonTemplate")
-  partyCombatCheck:SetPoint("TOPLEFT", selfToTCheck, "BOTTOMLEFT", 0, -4)
-  local partyCombatText = setCheckButtonLabel(partyCombatCheck, L.OPT_SHOW_PARTY_COMBAT_ENEMIES)
-  if partyCombatText then partyCombatText:SetTextColor(0.85, 0.87, 0.90) end
-  partyCombatCheck:SetScript("OnClick", function(self)
-    EnemyListDB.showPartyCombatEnemies = self:GetChecked() and true or false
-    layoutRows()
-  end)
-  partyCombatCheck:SetScript("OnEnter", function(s)
-    GameTooltip:SetOwner(s, "ANCHOR_RIGHT")
-    GameTooltip:SetText(L.TOOLTIP_OPT_SHOW_PARTY_COMBAT_ENEMIES, nil, nil, nil, nil, true)
-    GameTooltip:Show()
-  end)
-  partyCombatCheck:SetScript("OnLeave", GameTooltip_Hide)
+  local partyCombatCheck = Wb.CreateBooleanOption(scrollChild, {
+    placeAfter = selfToTCheck,
+    text = L.OPT_SHOW_PARTY_COMBAT_ENEMIES,
+    textColor = { 0.85, 0.87, 0.90 },
+    onClick = function(self)
+      EnemyListDB.showPartyCombatEnemies = self:GetChecked() and true or false
+      layoutRows()
+    end,
+    tooltip = L.TOOLTIP_OPT_SHOW_PARTY_COMBAT_ENEMIES,
+  })
   configFrame._elPartyCombatCheck = partyCombatCheck
 
   configFrame._elCompactCheck = compactCheck
   configFrame._elBgCheck = bgCheck
   configFrame._elSingleColCheck = singleColCheck
   configFrame._elGridCheck = gridCheck
-  configFrame._elNameplateRangeCheck = npRangeCheck
-  configFrame._elNameplateThreatCheck = npThreatCheck
+  --- |npRangeCheck|/|npThreatCheck|/|npMirrorCheck| are built on the Nameplates tab (see tab |do| block).
 
-  local lockCheck = CreateFrame("CheckButton", nil, scrollChild, "UICheckButtonTemplate")
-  lockCheck:SetPoint("TOPLEFT", partyCombatCheck, "BOTTOMLEFT", 0, -10)
-  local lockText = setCheckButtonLabel(lockCheck, L.OPT_LOCK)
-  if lockText then
-    lockText:SetTextColor(0.85, 0.87, 0.90)
-  end
-  lockCheck:SetScript("OnEnter", function()
-    GameTooltip:SetOwner(lockCheck, "ANCHOR_RIGHT")
-    GameTooltip:SetText(L.TOOLTIP_OPT_LOCK, nil, nil, nil, nil, true)
-    GameTooltip:Show()
-  end)
-  lockCheck:SetScript("OnLeave", GameTooltip_Hide)
+  local lockCheck = Wb.CreateBooleanOption(scrollChild, {
+    placeAfter = partyCombatCheck,
+    offsetY = -10,
+    text = L.OPT_LOCK,
+    textColor = { 0.85, 0.87, 0.90 },
+    tooltip = L.TOOLTIP_OPT_LOCK,
+  })
 
-  local testCheck = CreateFrame("CheckButton", nil, scrollChild, "UICheckButtonTemplate")
-  testCheck:SetPoint("TOPLEFT", lockCheck, "BOTTOMLEFT", 0, -6)
-  local testText = setCheckButtonLabel(testCheck, L.OPT_TEST_MODE)
-  if testText then
-    testText:SetTextColor(0.85, 0.87, 0.90)
-  end
-  testCheck:SetScript("OnClick", function(self)
-    EnemyListDB.testMode = self:GetChecked() and true or false
-    if EnemyList.OnDataChanged then
-      EnemyList.OnDataChanged()
-    end
-    updatePartyFrameSize()
-  end)
+  local testCheck = Wb.CreateBooleanOption(scrollChild, {
+    placeAfter = lockCheck,
+    offsetY = -6,
+    text = L.OPT_TEST_MODE,
+    textColor = { 0.85, 0.87, 0.90 },
+    onClick = function(self)
+      EnemyListDB.testMode = self:GetChecked() and true or false
+      if EnemyList.OnDataChanged then
+        EnemyList.OnDataChanged()
+      end
+      updatePartyFrameSize()
+    end,
+  })
 
   --- Footer: plain frame (no BackdropTemplate) so buttons are never clipped.
   local footer = CreateFrame("Frame", nil, configFrame)
@@ -6340,88 +6963,125 @@ local function createConfigFrame()
   testHint:SetText(L.OPT_TEST_MODE_HINT)
   configFrame._elTestHint = testHint
 
-  local coalesceRefreshCheck = CreateFrame("CheckButton", nil, scrollChild, "UICheckButtonTemplate")
-  coalesceRefreshCheck:SetPoint("TOPLEFT", testHint, "BOTTOMLEFT", -24, -8)
-  local coalesceRefreshText = setCheckButtonLabel(coalesceRefreshCheck, L.OPT_COALESCE_UI_REFRESH)
-  if coalesceRefreshText then
-    coalesceRefreshText:SetTextColor(0.85, 0.87, 0.90)
-  end
-  coalesceRefreshCheck:SetScript("OnClick", function(self)
-    EnemyListDB.coalesceUIRefresh = self:GetChecked() and true or false
-    if main then
-      layoutRows()
-    end
-  end)
-  coalesceRefreshCheck:SetScript("OnEnter", function()
-    GameTooltip:SetOwner(coalesceRefreshCheck, "ANCHOR_RIGHT")
-    GameTooltip:SetText(L.TOOLTIP_OPT_COALESCE_UI_REFRESH, nil, nil, nil, nil, true)
-    GameTooltip:Show()
-  end)
-  coalesceRefreshCheck:SetScript("OnLeave", GameTooltip_Hide)
+  local coalesceRefreshCheck = Wb.CreateBooleanOption(scrollChild, {
+    point = "TOPLEFT",
+    ref = testHint,
+    relPoint = "BOTTOMLEFT",
+    x = -24,
+    y = -8,
+    text = L.OPT_COALESCE_UI_REFRESH,
+    textColor = { 0.85, 0.87, 0.90 },
+    onClick = function(self)
+      EnemyListDB.coalesceUIRefresh = self:GetChecked() and true or false
+      if main then
+        layoutRows()
+      end
+    end,
+    tooltip = L.TOOLTIP_OPT_COALESCE_UI_REFRESH,
+  })
   configFrame._elCoalesceRefreshCheck = coalesceRefreshCheck
 
   --- Feature 6: fade out of combat checkbox
-  local fadeCheck = CreateFrame("CheckButton", nil, scrollChild, "UICheckButtonTemplate")
-  fadeCheck:SetPoint("TOPLEFT", coalesceRefreshCheck, "BOTTOMLEFT", 0, -6)
-  local fadeText = setCheckButtonLabel(fadeCheck, "Fade when out of combat")
-  if fadeText then fadeText:SetTextColor(0.85, 0.87, 0.90) end
-  fadeCheck:SetScript("OnClick", function(self)
-    EnemyListDB.fadeOutOfCombat = self:GetChecked() and true or false
-    if type(EnemyList.UpdateFadeOutCombatTicker) == "function" then
-      EnemyList.UpdateFadeOutCombatTicker()
-    end
-  end)
-  fadeCheck:SetScript("OnEnter", function()
-    GameTooltip:SetOwner(fadeCheck, "ANCHOR_RIGHT")
-    GameTooltip:SetText("When enabled, the enemy list fades to 30% opacity outside of combat.", nil, nil, nil, nil, true)
-    GameTooltip:Show()
-  end)
-  fadeCheck:SetScript("OnLeave", GameTooltip_Hide)
+  local fadeCheck = Wb.CreateBooleanOption(scrollChild, {
+    placeAfter = coalesceRefreshCheck,
+    offsetY = -6,
+    text = L.OPT_FADE_OOC,
+    textColor = { 0.85, 0.87, 0.90 },
+    onClick = function(self)
+      EnemyListDB.fadeOutOfCombat = self:GetChecked() and true or false
+      if type(EnemyList.UpdateFadeOutCombatTicker) == "function" then
+        EnemyList.UpdateFadeOutCombatTicker()
+      end
+    end,
+    tooltip = L.TOOLTIP_OPT_FADE_OOC,
+  })
   configFrame._elFadeCheck = fadeCheck
 
   --- Feature 10: healer mode checkbox
-  local healerCheck = CreateFrame("CheckButton", nil, scrollChild, "UICheckButtonTemplate")
-  healerCheck:SetPoint("TOPLEFT", fadeCheck, "BOTTOMLEFT", 0, -4)
-  local healerText = setCheckButtonLabel(healerCheck, "Healer mode")
-  if healerText then healerText:SetTextColor(0.85, 0.87, 0.90) end
-  healerCheck:SetScript("OnClick", function(self)
-    EnemyListDB.healerMode = self:GetChecked() and true or false
-    layoutRows()
-  end)
-  healerCheck:SetScript("OnEnter", function()
-    GameTooltip:SetOwner(healerCheck, "ANCHOR_RIGHT")
-    GameTooltip:SetText("Healer mode: hides threat bars and prominently shows who each enemy is attacking with color-coded health.", nil, nil, nil, nil, true)
-    GameTooltip:Show()
-  end)
-  healerCheck:SetScript("OnLeave", GameTooltip_Hide)
+  local healerCheck = Wb.CreateBooleanOption(scrollChild, {
+    placeAfter = fadeCheck,
+    text = L.OPT_HEALER_MODE,
+    textColor = { 0.85, 0.87, 0.90 },
+    onClick = function(self)
+      EnemyListDB.healerMode = self:GetChecked() and true or false
+      layoutRows()
+    end,
+    tooltip = L.TOOLTIP_OPT_HEALER_MODE,
+  })
   configFrame._elHealerCheck = healerCheck
 
-  local minimapShowCheck = CreateFrame("CheckButton", nil, scrollChild, "UICheckButtonTemplate")
-  minimapShowCheck:SetPoint("TOPLEFT", healerCheck, "BOTTOMLEFT", 0, -4)
-  local minimapShowText = setCheckButtonLabel(minimapShowCheck, L.OPT_MINIMAP_SHOW_BUTTON)
-  if minimapShowText then minimapShowText:SetTextColor(0.85, 0.87, 0.90) end
-  minimapShowCheck:SetScript("OnClick", function(self)
-    EnemyListDB.minimapButtonHidden = not self:GetChecked()
-    elSafe("createMinimapButton", createMinimapButton)
-    enemyListApplyMinimapButtonVisibility()
-  end)
-  minimapShowCheck:SetScript("OnEnter", function()
-    GameTooltip:SetOwner(minimapShowCheck, "ANCHOR_RIGHT")
-    GameTooltip:SetText(L.TOOLTIP_OPT_MINIMAP_SHOW_BUTTON, nil, nil, nil, nil, true)
-    GameTooltip:Show()
-  end)
-  minimapShowCheck:SetScript("OnLeave", GameTooltip_Hide)
+  local minimapShowCheck = Wb.CreateBooleanOption(scrollChild, {
+    placeAfter = healerCheck,
+    text = L.OPT_MINIMAP_SHOW_BUTTON,
+    textColor = { 0.85, 0.87, 0.90 },
+    onClick = function(self)
+      EnemyListDB.minimapButtonHidden = not self:GetChecked()
+      elSafe("createMinimapButton", createMinimapButton)
+      enemyListApplyMinimapButtonVisibility()
+    end,
+    tooltip = L.TOOLTIP_OPT_MINIMAP_SHOW_BUTTON,
+  })
   configFrame._elMinimapShowCheck = minimapShowCheck
 
+  --- Fit Appearance scroll child to content (no extra blank area); re-run on show / sync (wrapped hint height).
+  --- A single "last" widget (GetTop / GetTop-GetBottom) can equal the *viewport* on some clients, giving
+  --- |range| ≈ 0 and hiding the scrollbar. Measure the full vertical span of all direct children in
+  --- |sc|'s coordinate system (Y up, origin at parent bottom): max(GetTop) - min(GetBottom) + margin.
+  configFrame._elResizeAppearanceScroll = function()
+    local sc = configFrame._elScrollChild
+    if not sc or not sc.SetHeight or not sc.GetNumChildren or not sc.GetChildren then
+      return
+    end
+    local n = sc:GetNumChildren() or 0
+    if n < 1 then
+      return
+    end
+    local maxT, minB
+    for i = 1, n do
+      local ch = select(i, sc:GetChildren())
+      if ch and ch.GetTop and ch.GetBottom and (not ch.IsShown or ch:IsShown()) then
+        local t, b = ch:GetTop(), ch:GetBottom()
+        if t and (not maxT or t > maxT) then
+          maxT = t
+        end
+        if b and (not minB or b < minB) then
+          minB = b
+        end
+      end
+    end
+    local span = 0
+    if minB and maxT and maxT > minB then
+      span = maxT - minB
+    end
+    if span < 1 then
+      --- Fallback: single-widget hint if layout not ready yet
+      local last = configFrame._elMinimapShowCheck
+      if last and last.GetTop and (not last.GetParent or last:GetParent() == sc) then
+        local lt = last:GetTop()
+        if lt and lt > 0 then
+          span = lt + 48
+        end
+      end
+    end
+    if span < 1 or span > 12000 then
+      return
+    end
+    local need = span + 48
+    sc:SetHeight(need)
+    if configFrame._elSyncScroll then
+      configFrame._elSyncScroll()
+    end
+  end
+
   --- Feature: party frames checkbox and size slider.
-  --- Tab system: 6 tabs — Appearance, Party, Raid, Colors, Profiles, Keybinds.
-  local tabAppearance, tabParty, tabRaid, tabColors, tabProfiles, tabKeybinds
+  --- Tab system: 7 tabs — Appearance, Party, Raid, Colors, Profiles, Nameplates, Keybinds.
+  local tabAppearance, tabParty, tabRaid, tabColors, tabProfiles, tabNameplates, tabKeybinds
   local scrollFrame2, scrollChild2, scrollFrame3, scrollChild3, scrollFrame4, scrollChild4,
-        scrollFrame5, scrollChild5, scrollFrame6, scrollChild6
+        scrollFrame5, scrollChild5, scrollFrame6, scrollChild6, scrollFrame7, scrollChild7
   do
     local tabH = 22
     local tabTotalW = innerW + sbW + sbGap
-    local tabW = math.floor(tabTotalW / 6) - 2
+    local tabW = math.floor(tabTotalW / 7) - 2
     local bdMixinTab = (type(BackdropTemplateMixin) == "table") and "BackdropTemplate" or nil
 
     --- Tab bar container.
@@ -6456,7 +7116,8 @@ local function createConfigFrame()
     tabRaid       = makeTab(L.OPT_TAB_RAID or "Raid", (tabW + 2) * 2)
     tabColors     = makeTab(L.OPT_TAB_COLORS or "Colors", (tabW + 2) * 3)
     tabProfiles   = makeTab(L.OPT_TAB_PROFILES or "Profiles", (tabW + 2) * 4)
-    tabKeybinds   = makeTab(L.OPT_TAB_KEYBINDS, (tabW + 2) * 5)
+    tabNameplates = makeTab(L.OPT_TAB_NAMEPLATES, (tabW + 2) * 5)
+    tabKeybinds   = makeTab(L.OPT_TAB_KEYBINDS, (tabW + 2) * 6)
 
     local contentTop = tabBar
 
@@ -6484,6 +7145,83 @@ local function createConfigFrame()
     scrollFrame4, scrollChild4 = makeScrollPanel()  -- Colors
     scrollFrame5, scrollChild5 = makeScrollPanel()  -- Profiles
     scrollFrame6, scrollChild6 = makeScrollPanel()  -- Raid
+    scrollFrame7, scrollChild7 = makeScrollPanel()  -- Nameplates
+
+    do
+      local nptTop = CreateFrame("Frame", nil, scrollChild7)
+      nptTop:SetSize(innerW, 1)
+      nptTop:SetPoint("TOPLEFT", scrollChild7, "TOPLEFT", 0, 0)
+      local nptSec = select(1, addConfigSectionHeader(scrollChild7, nptTop, -6, L.CONFIG_SECTION_NAMEPLATES, nil, innerW - 8))
+      --- Experimental warning banner. Nameplate features (threat overlay + mirror) interact with
+      --- Blizzard/Plater plate frames in fragile ways and can have edge cases on Vanilla. Wrapped
+      --- in a Frame so |Wb.CreateBooleanOption(placeAfter = …)| can anchor to it.
+      local nptWarnFrame = CreateFrame("Frame", nil, scrollChild7)
+      nptWarnFrame:SetPoint("TOPLEFT", nptSec, "BOTTOMLEFT", 0, -8)
+      nptWarnFrame:SetPoint("RIGHT", scrollChild7, "RIGHT", -8, 0)
+      nptWarnFrame:SetHeight(48)
+      local nptWarn = nptWarnFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+      nptWarn:SetPoint("TOPLEFT", nptWarnFrame, "TOPLEFT", 6, 0)
+      nptWarn:SetPoint("RIGHT", nptWarnFrame, "RIGHT", -2, 0)
+      nptWarn:SetJustifyH("LEFT")
+      nptWarn:SetJustifyV("TOP")
+      nptWarn:SetWordWrap(true)
+      nptWarn:SetText(L.NAMEPLATE_EXPERIMENTAL_WARNING or "|cffffcc00Note:|r Nameplate features are still experimental. They can interact unexpectedly with other nameplate addons (e.g. Plater) and may show visual glitches. Disable them if you run into issues.")
+      nptWarn:SetTextColor(0.95, 0.85, 0.45)
+      local npRangeCheck = Wb.CreateBooleanOption(scrollChild7, {
+        placeAfter = nptWarnFrame,
+        offsetY = -10,
+        text = L.OPT_EXTEND_NAMEPLATE_RANGE,
+        textColor = { 0.85, 0.87, 0.90 },
+        onClick = function(self)
+          EnemyListDB.extendNameplateRange = self:GetChecked() and true or false
+          if EnemyListDB.extendNameplateRange and type(EnemyList.ApplyNameplateRangePreference) == "function" then
+            EnemyList.ApplyNameplateRangePreference()
+          end
+        end,
+        tooltip = L.TOOLTIP_OPT_EXTEND_NAMEPLATE_RANGE,
+      })
+      local npThreatCheck = Wb.CreateBooleanOption(scrollChild7, {
+        placeAfter = npRangeCheck,
+        text = L.OPT_NAMEPLATE_THREAT,
+        textColor = { 0.85, 0.87, 0.90 },
+        onClick = function(self)
+          EnemyListDB.nameplateThreatOverlay = self:GetChecked() and true or false
+          if type(EnemyList.RefreshNameplateThreatOverlays) == "function" then
+            EnemyList.RefreshNameplateThreatOverlays(true)
+          end
+        end,
+        tooltip = L.TOOLTIP_OPT_NAMEPLATE_THREAT,
+      })
+      local npMirrorCheck = Wb.CreateBooleanOption(scrollChild7, {
+        placeAfter = npThreatCheck,
+        text = L.OPT_NAMEPLATE_LIST_MIRROR,
+        textColor = { 0.85, 0.87, 0.90 },
+        onClick = function(self)
+          EnemyListDB.nameplateListMirror = self:GetChecked() and true or false
+          if type(EnemyList.RefreshNameplateListMirrors) == "function" then
+            EnemyList.RefreshNameplateListMirrors(true)
+          end
+        end,
+        tooltip = L.TOOLTIP_OPT_NAMEPLATE_LIST_MIRROR,
+      })
+      local npThreatSecondCheck = Wb.CreateBooleanOption(scrollChild7, {
+        placeAfter = npMirrorCheck,
+        text = L.OPT_NAMEPLATE_THREAT_SECOND,
+        textColor = { 0.85, 0.87, 0.90 },
+        onClick = function(self)
+          EnemyListDB.nameplateThreatSecondStyle = self:GetChecked() and true or false
+          if type(EnemyList.RefreshNameplateThreatOverlays) == "function" then
+            EnemyList.RefreshNameplateThreatOverlays(true)
+          end
+        end,
+        tooltip = L.TOOLTIP_OPT_NAMEPLATE_THREAT_SECOND,
+      })
+      configFrame._elNameplateRangeCheck = npRangeCheck
+      configFrame._elNameplateThreatCheck = npThreatCheck
+      configFrame._elNameplateMirrorCheck = npMirrorCheck
+      configFrame._elNameplateThreatSecondCheck = npThreatSecondCheck
+      scrollChild7:SetHeight(360)
+    end
 
     scrollFrame:ClearAllPoints()
     scrollFrame:SetPoint("TOPLEFT", contentTop, "BOTTOMLEFT", 0, -2)
@@ -6506,8 +7244,10 @@ local function createConfigFrame()
     end
 
     local function selectTab(tab)
-      scrollFrame:Hide(); scrollFrame2:Hide(); scrollFrame3:Hide(); scrollFrame4:Hide(); scrollFrame5:Hide(); scrollFrame6:Hide()
-      styleTab(tabAppearance, false); styleTab(tabParty, false); styleTab(tabRaid, false); styleTab(tabColors, false); styleTab(tabProfiles, false); styleTab(tabKeybinds, false)
+      scrollFrame:Hide(); scrollFrame2:Hide(); scrollFrame3:Hide(); scrollFrame4:Hide(); scrollFrame5:Hide()
+      scrollFrame6:Hide(); scrollFrame7:Hide()
+      styleTab(tabAppearance, false); styleTab(tabParty, false); styleTab(tabRaid, false); styleTab(tabColors, false)
+      styleTab(tabProfiles, false); styleTab(tabNameplates, false); styleTab(tabKeybinds, false)
       local activeSf, activeSc
       if tab == 1 then
         scrollFrame:Show(); styleTab(tabAppearance, true)
@@ -6526,6 +7266,9 @@ local function createConfigFrame()
         scrollFrame5:Show(); styleTab(tabProfiles, true)
         if configFrame._elProfilesRefresh then configFrame._elProfilesRefresh() end
         activeSf, activeSc = scrollFrame5, scrollChild5
+      elseif tab == 6 then
+        scrollFrame7:Show(); styleTab(tabNameplates, true)
+        activeSf, activeSc = scrollFrame7, scrollChild7
       else
         scrollFrame2:Show(); styleTab(tabKeybinds, true)
         activeSf, activeSc = scrollFrame2, scrollChild2
@@ -6535,17 +7278,39 @@ local function createConfigFrame()
       if configFrame._elSyncActiveScrollBounds then
         configFrame._elSyncActiveScrollBounds()
       end
+      if syncConfigInnerLayout and configFrame then
+        syncConfigInnerLayout(configFrame)
+      end
+      --- One frame later: scroll child sizes are final; refresh range so the shared scrollbar shows when content overflows.
+      if C_Timer and C_Timer.After then
+        C_Timer.After(0, function()
+          local cf = configFrame
+          if not cf then return end
+          --- Re-measure Appearance content height after layout (must run before scroll range).
+          if tab == 1 and cf._elResizeAppearanceScroll then
+            cf._elResizeAppearanceScroll()
+          end
+          if cf._elSyncActiveScrollBounds then
+            cf._elSyncActiveScrollBounds()
+          elseif cf._elSyncScroll then
+            cf._elSyncScroll()
+          end
+        end)
+      end
     end
     tabAppearance:SetScript("OnClick", function() selectTab(1) end)
     tabParty:SetScript("OnClick", function() selectTab(2) end)
     tabRaid:SetScript("OnClick", function() selectTab(3) end)
     tabColors:SetScript("OnClick", function() selectTab(4) end)
     tabProfiles:SetScript("OnClick", function() selectTab(5) end)
-    tabKeybinds:SetScript("OnClick", function() selectTab(6) end)
+    tabNameplates:SetScript("OnClick", function() selectTab(6) end)
+    tabKeybinds:SetScript("OnClick", function() selectTab(7) end)
+    --- Must exist before |selectTab(1)| so |syncConfigInnerLayout| sizes every pane (not only Appearance).
+    configFrame._elTabScrollChildren = { scrollChild, scrollChild2, scrollChild3, scrollChild4, scrollChild5, scrollChild6, scrollChild7 }
     selectTab(1)
     configFrame._elSelectTab = selectTab
     configFrame._elTabBar = tabBar
-    configFrame._elTabs = { tabAppearance, tabParty, tabRaid, tabColors, tabProfiles, tabKeybinds }
+    configFrame._elTabs = { tabAppearance, tabParty, tabRaid, tabColors, tabProfiles, tabNameplates, tabKeybinds }
   end
 
   --- Shared builder for the Party- and Raid-tab control panels. Each call produces an identical
@@ -6556,15 +7321,21 @@ local function createConfigFrame()
   --- Returns a table of widget handles that |refreshConfigFieldsFromDB| uses to re-sync the sliders
   --- and checkboxes after a profile switch.
   local function buildPartyFramePanel(parent, profileName, opts)
+    local Wdg = EnemyList.ConfigWidgets
     opts = opts or {}
     local titleText = opts.title or "Party Frames"
     local descText  = opts.desc  or "Clickable party member frames with color-coded aggro indicators. Drag to reposition."
     local anchorTop = opts.anchorTop
+    --- Optional nudge of |topMark| from the scroll pane's left (party/raid: usually 0).
+    local anchorPanelOffsetX = tonumber(opts.anchorPanelOffsetX) or 0
 
     local topMark = CreateFrame("Frame", nil, parent)
     topMark:SetSize(innerW, 1)
     if anchorTop then
-      topMark:SetPoint("TOPLEFT", anchorTop, "BOTTOMLEFT", 0, -6)
+      --- Do not use |anchorTop| BOTTOMLEFT for X: that point inherits the raid header’s text inset (~6px),
+      --- so the title would land at 12px while Party uses 6. Pin left to |parent| and only stack vertically.
+      topMark:SetPoint("TOP", anchorTop, "BOTTOM", 0, -6)
+      topMark:SetPoint("LEFT", parent, "LEFT", anchorPanelOffsetX, 0)
     else
       topMark:SetPoint("TOPLEFT", parent, "TOPLEFT", 0, 0)
     end
@@ -6581,15 +7352,28 @@ local function createConfigFrame()
     desc:SetWordWrap(true)
     desc:SetTextColor(0.62, 0.65, 0.69)
     desc:SetText(descText)
+    if configFrame then
+      if profileName == "party" then
+        configFrame._elPartyPanelDesc = desc
+      elseif profileName == "raid" then
+        configFrame._elRaidPanelDesc = desc
+      end
+    end
 
-    local partyCheck = CreateFrame("CheckButton", nil, parent, "UICheckButtonTemplate")
-    partyCheck:SetPoint("TOPLEFT", desc, "BOTTOMLEFT", -6, -8)
-    local partyTextFs = setCheckButtonLabel(partyCheck, "Enable party frames")
-    if partyTextFs then partyTextFs:SetTextColor(0.85, 0.87, 0.90) end
-    partyCheck:SetScript("OnClick", function(self)
-      _EL.profileWrite(profileName, "showPartyFrames", self:GetChecked() and true or false)
-      togglePartyFramesVisibility()
-    end)
+    local partyCheck = Wdg.CreateBooleanOption(parent, {
+      point = "TOPLEFT",
+      ref = desc,
+      relPoint = "BOTTOMLEFT",
+      x = -6,
+      y = -8,
+      text = L.OPT_PARTY_ENABLE_FRAMES,
+      textColor = { 0.85, 0.87, 0.90 },
+      onClick = function(self)
+        _EL.profileWrite(profileName, "showPartyFrames", self:GetChecked() and true or false)
+        togglePartyFramesVisibility()
+      end,
+      tooltip = L.TOOLTIP_OPT_PARTY_ENABLE_FRAMES,
+    })
 
     local partySizeRow = CreateFrame("Frame", nil, parent)
     partySizeRow:SetSize(innerW, 42)
@@ -6607,14 +7391,16 @@ local function createConfigFrame()
       dbWriteGate = configSliderDbGate,
     })
 
-    local partyVerticalCheck = CreateFrame("CheckButton", nil, parent, "UICheckButtonTemplate")
-    partyVerticalCheck:SetPoint("TOPLEFT", partySizeRow, "BOTTOMLEFT", 0, -4)
-    local partyVerticalText = setCheckButtonLabel(partyVerticalCheck, "Vertical layout")
-    if partyVerticalText then partyVerticalText:SetTextColor(0.85, 0.87, 0.90) end
-    partyVerticalCheck:SetScript("OnClick", function(self)
-      _EL.profileWrite(profileName, "partyFrameVertical", self:GetChecked() and true or false)
-      updatePartyFrameSize()
-    end)
+    local partyVerticalCheck = Wdg.CreateBooleanOption(parent, {
+      placeAfter = partySizeRow,
+      text = L.OPT_PARTY_VERTICAL_LAYOUT,
+      textColor = { 0.85, 0.87, 0.90 },
+      onClick = function(self)
+        _EL.profileWrite(profileName, "partyFrameVertical", self:GetChecked() and true or false)
+        updatePartyFrameSize()
+      end,
+      tooltip = L.TOOLTIP_OPT_PARTY_VERTICAL_LAYOUT,
+    })
 
     local unitGapRow = CreateFrame("Frame", nil, parent)
     unitGapRow:SetSize(innerW, 42)
@@ -6648,14 +7434,16 @@ local function createConfigFrame()
       dbWriteGate = configSliderDbGate,
     })
 
-    local partyHpDeficitCheck = CreateFrame("CheckButton", nil, parent, "UICheckButtonTemplate")
-    partyHpDeficitCheck:SetPoint("TOPLEFT", groupGapRow, "BOTTOMLEFT", 0, -4)
-    local partyHpDeficitText = setCheckButtonLabel(partyHpDeficitCheck, L.OPT_PARTY_SHOW_HP_DEFICIT)
-    if partyHpDeficitText then partyHpDeficitText:SetTextColor(0.85, 0.87, 0.90) end
-    partyHpDeficitCheck:SetScript("OnClick", function(self)
-      _EL.profileWrite(profileName, "partyFrameShowHpDeficit", self:GetChecked() and true or false)
-      updatePartyFrameSize()
-    end)
+    local partyHpDeficitCheck = Wdg.CreateBooleanOption(parent, {
+      placeAfter = groupGapRow,
+      text = L.OPT_PARTY_SHOW_HP_DEFICIT,
+      textColor = { 0.85, 0.87, 0.90 },
+      onClick = function(self)
+        _EL.profileWrite(profileName, "partyFrameShowHpDeficit", self:GetChecked() and true or false)
+        updatePartyFrameSize()
+      end,
+      tooltip = L.TOOLTIP_OPT_PARTY_SHOW_HP_DEFICIT,
+    })
 
     local partyHpDeficitFontScaleRow = CreateFrame("Frame", nil, parent)
     partyHpDeficitFontScaleRow:SetSize(innerW, 42)
@@ -6673,14 +7461,16 @@ local function createConfigFrame()
       dbWriteGate = configSliderDbGate,
     })
 
-    local partyDebuffCheck = CreateFrame("CheckButton", nil, parent, "UICheckButtonTemplate")
-    partyDebuffCheck:SetPoint("TOPLEFT", partyHpDeficitFontScaleRow, "BOTTOMLEFT", 0, -4)
-    local partyDebuffText = setCheckButtonLabel(partyDebuffCheck, L.OPT_PARTY_SHOW_DEBUFFS)
-    if partyDebuffText then partyDebuffText:SetTextColor(0.85, 0.87, 0.90) end
-    partyDebuffCheck:SetScript("OnClick", function(self)
-      _EL.profileWrite(profileName, "partyFrameShowDebuffs", self:GetChecked() and true or false)
-      updatePartyFrameSize()
-    end)
+    local partyDebuffCheck = Wdg.CreateBooleanOption(parent, {
+      placeAfter = partyHpDeficitFontScaleRow,
+      text = L.OPT_PARTY_SHOW_DEBUFFS,
+      textColor = { 0.85, 0.87, 0.90 },
+      onClick = function(self)
+        _EL.profileWrite(profileName, "partyFrameShowDebuffs", self:GetChecked() and true or false)
+        updatePartyFrameSize()
+      end,
+      tooltip = L.TOOLTIP_OPT_PARTY_SHOW_DEBUFFS,
+    })
 
     local partyHpBarRow = CreateFrame("Frame", nil, parent)
     partyHpBarRow:SetSize(innerW, 42)
@@ -6749,44 +7539,38 @@ local function createConfigFrame()
     })
 
     --- Aggro border — the colored ring around a unit when enemies are attacking them.
-    local aggroBorderCheck = CreateFrame("CheckButton", nil, parent, "UICheckButtonTemplate")
-    aggroBorderCheck:SetPoint("TOPLEFT", aggroCountOffsetYRow, "BOTTOMLEFT", 0, -4)
-    local aggroBorderText = setCheckButtonLabel(aggroBorderCheck, L.OPT_PARTY_AGGRO_BORDER or "Show aggro border")
-    if aggroBorderText then aggroBorderText:SetTextColor(0.85, 0.87, 0.90) end
-    aggroBorderCheck:SetScript("OnClick", function(self)
-      _EL.profileWrite(profileName, "partyShowAggroBorder", self:GetChecked() and true or false)
-      if applyPartyFrameAggroAttackedChrome then applyPartyFrameAggroAttackedChrome() end
-    end)
-    aggroBorderCheck:SetScript("OnEnter", function(s)
-      GameTooltip:SetOwner(s, "ANCHOR_RIGHT")
-      GameTooltip:SetText(L.TOOLTIP_OPT_PARTY_AGGRO_BORDER or "Paint the frame border in the unit's aggro color when enemies are attacking them. Uncheck to keep the idle grey border even under fire (background + digit still change).", nil, nil, nil, nil, true)
-      GameTooltip:Show()
-    end)
-    aggroBorderCheck:SetScript("OnLeave", GameTooltip_Hide)
+    local aggroBorderCheck = Wdg.CreateBooleanOption(parent, {
+      placeAfter = aggroCountOffsetYRow,
+      text = L.OPT_PARTY_AGGRO_BORDER,
+      textColor = { 0.85, 0.87, 0.90 },
+      onClick = function(self)
+        _EL.profileWrite(profileName, "partyShowAggroBorder", self:GetChecked() and true or false)
+        if applyPartyFrameAggroAttackedChrome then applyPartyFrameAggroAttackedChrome() end
+      end,
+      tooltip = L.TOOLTIP_OPT_PARTY_AGGRO_BORDER,
+    })
 
-    local aggroBorderCustomColorCheck = CreateFrame("CheckButton", nil, parent, "UICheckButtonTemplate")
-    aggroBorderCustomColorCheck:SetPoint("TOPLEFT", aggroBorderCheck, "BOTTOMLEFT", 0, -4)
-    local aggroBorderCustomColorText = setCheckButtonLabel(aggroBorderCustomColorCheck, L.OPT_PARTY_AGGRO_BORDER_CUSTOM or "Use single color for aggro border")
-    if aggroBorderCustomColorText then aggroBorderCustomColorText:SetTextColor(0.85, 0.87, 0.90) end
-    aggroBorderCustomColorCheck:SetScript("OnClick", function(self)
-      _EL.profileWrite(profileName, "partyUseCustomAggroBorderColor", self:GetChecked() and true or false)
-      if applyPartyFrameAggroAttackedChrome then applyPartyFrameAggroAttackedChrome() end
-    end)
-    aggroBorderCustomColorCheck:SetScript("OnEnter", function(s)
-      GameTooltip:SetOwner(s, "ANCHOR_RIGHT")
-      GameTooltip:SetText(L.TOOLTIP_OPT_PARTY_AGGRO_BORDER_CUSTOM or "When checked, the aggro border uses the configured 'Aggro border' color (Colors tab) for every unit instead of a per-member palette color.", nil, nil, nil, nil, true)
-      GameTooltip:Show()
-    end)
-    aggroBorderCustomColorCheck:SetScript("OnLeave", GameTooltip_Hide)
+    local aggroBorderCustomColorCheck = Wdg.CreateBooleanOption(parent, {
+      placeAfter = aggroBorderCheck,
+      text = L.OPT_PARTY_AGGRO_BORDER_CUSTOM,
+      textColor = { 0.85, 0.87, 0.90 },
+      onClick = function(self)
+        _EL.profileWrite(profileName, "partyUseCustomAggroBorderColor", self:GetChecked() and true or false)
+        if applyPartyFrameAggroAttackedChrome then applyPartyFrameAggroAttackedChrome() end
+      end,
+      tooltip = L.TOOLTIP_OPT_PARTY_AGGRO_BORDER_CUSTOM,
+    })
 
     local aggroBorderThicknessRow = CreateFrame("Frame", nil, parent)
     aggroBorderThicknessRow:SetSize(innerW, 42)
-    aggroBorderThicknessRow:SetPoint("TOPLEFT", aggroBorderCustomColorCheck, "BOTTOMLEFT", 6, -2)
+    --- Same left edge and |rowInnerWidth| as the aggro Y offset / other Party sliders. A +6 inset here
+    --- plus |layoutConfigOptionSliderColumns| setting the row to full |baseW| shifted label + track + value.
+    aggroBorderThicknessRow:SetPoint("TOPLEFT", aggroBorderCustomColorCheck, "BOTTOMLEFT", 0, -2)
     local aggroBorderThicknessSlider = createConfigOptionSlider(aggroBorderThicknessRow, {
       label = L.OPT_PARTY_AGGRO_BORDER_THICKNESS or "Aggro border thickness",
       tooltip = L.TOOLTIP_OPT_PARTY_AGGRO_BORDER_THICKNESS or "Thickness of the aggro border in pixels (1–6).",
       min = 1, max = 6, step = 1, integer = true,
-      rowInnerWidth = innerW - 12,
+      rowInnerWidth = innerW,
       format = function(v) return tostring(math.floor(v + 0.5)) .. "px" end,
       onChange = function(v)
         _EL.profileWrite(profileName, "partyAggroBorderThickness", math.max(1, math.min(6, math.floor(v + 0.5))))
@@ -6795,66 +7579,225 @@ local function createConfigFrame()
       dbWriteGate = configSliderDbGate,
     })
 
-    local partySelfCountCheck = CreateFrame("CheckButton", nil, parent, "UICheckButtonTemplate")
-    partySelfCountCheck:SetPoint("TOPLEFT", aggroBorderThicknessRow, "BOTTOMLEFT", -6, -6)
-    local partySelfCountText = setCheckButtonLabel(partySelfCountCheck, L.OPT_SHOW_SELF_AGGRO_COUNT or "Show aggro count on your own frame")
-    if partySelfCountText then partySelfCountText:SetTextColor(0.85, 0.87, 0.90) end
-    partySelfCountCheck:SetScript("OnClick", function(self)
-      _EL.profileWrite(profileName, "showSelfAggroCount", self:GetChecked() and true or false)
-      --- |applyPartyFrameAggroAttackedChrome| is called from the enemy-list layout pass; trigger
-      --- one now so the change shows immediately instead of waiting for the next refresh tick.
-      if applyPartyFrameAggroAttackedChrome then applyPartyFrameAggroAttackedChrome() end
-    end)
-    partySelfCountCheck:SetScript("OnEnter", function(s)
-      GameTooltip:SetOwner(s, "ANCHOR_RIGHT")
-      GameTooltip:SetText(L.TOOLTIP_OPT_SHOW_SELF_AGGRO_COUNT or "When checked, your own party/raid frame shows the number of enemies currently attacking you (same as it does for other members). Uncheck to keep only the bg/border highlight on your own frame.", nil, nil, nil, nil, true)
-      GameTooltip:Show()
-    end)
-    partySelfCountCheck:SetScript("OnLeave", GameTooltip_Hide)
+    local partySelfCountCheck = Wdg.CreateBooleanOption(parent, {
+      placeAfter = aggroBorderThicknessRow,
+      offsetY = -6,
+      text = L.OPT_SHOW_SELF_AGGRO_COUNT,
+      textColor = { 0.85, 0.87, 0.90 },
+      onClick = function(self)
+        _EL.profileWrite(profileName, "showSelfAggroCount", self:GetChecked() and true or false)
+        --- |applyPartyFrameAggroAttackedChrome| is called from the enemy-list layout pass; trigger
+        --- one now so the change shows immediately instead of waiting for the next refresh tick.
+        if applyPartyFrameAggroAttackedChrome then applyPartyFrameAggroAttackedChrome() end
+      end,
+      tooltip = L.TOOLTIP_OPT_SHOW_SELF_AGGRO_COUNT,
+    })
 
     --- Incoming heal prediction toggle. Uses UnitGetIncomingHeals() when the client supports it;
     --- on older Classic clients the overlay just stays empty (no error).
-    local incHealCheck = CreateFrame("CheckButton", nil, parent, "UICheckButtonTemplate")
-    incHealCheck:SetPoint("TOPLEFT", partySelfCountCheck, "BOTTOMLEFT", 0, -4)
-    local incHealCheckText = setCheckButtonLabel(incHealCheck, L.OPT_PARTY_INC_HEALS or "Show incoming heals")
-    if incHealCheckText then incHealCheckText:SetTextColor(0.85, 0.87, 0.90) end
-    incHealCheck:SetScript("OnClick", function(self)
-      _EL.profileWrite(profileName, "partyShowIncomingHeals", self:GetChecked() and true or false)
-      _EL.reapplyPartyBarColors()
-    end)
-    incHealCheck:SetScript("OnEnter", function(s)
-      GameTooltip:SetOwner(s, "ANCHOR_RIGHT")
-      GameTooltip:SetText(L.TOOLTIP_OPT_PARTY_INC_HEALS or "Overlays a translucent strip inside the HP bar showing predicted incoming heals from self + raid. Colors (overall + self-only) live on the Colors tab. Classic clients without |UnitGetIncomingHeals| silently keep the bar empty.", nil, nil, nil, nil, true)
-      GameTooltip:Show()
-    end)
-    incHealCheck:SetScript("OnLeave", GameTooltip_Hide)
+    local incHealCheck = Wdg.CreateBooleanOption(parent, {
+      placeAfter = partySelfCountCheck,
+      text = L.OPT_PARTY_INC_HEALS,
+      textColor = { 0.85, 0.87, 0.90 },
+      onClick = function(self)
+        _EL.profileWrite(profileName, "partyShowIncomingHeals", self:GetChecked() and true or false)
+        _EL.reapplyPartyBarColors()
+      end,
+      tooltip = L.TOOLTIP_OPT_PARTY_INC_HEALS,
+    })
 
-    local partyManaCheck = CreateFrame("CheckButton", nil, parent, "UICheckButtonTemplate")
-    partyManaCheck:SetPoint("TOPLEFT", incHealCheck, "BOTTOMLEFT", 0, -4)
-    local partyManaCheckText = setCheckButtonLabel(partyManaCheck, L.OPT_SHOW_PARTY_MANA or "Show mana / power bar on party frames")
-    if partyManaCheckText then partyManaCheckText:SetTextColor(0.85, 0.87, 0.90) end
-    partyManaCheck:SetScript("OnClick", function(self)
-      _EL.profileWrite(profileName, "showPartyManaBars", self:GetChecked() and true or false)
-      if EnemyListDB.activeProfileName == profileName and syncPartyFrameUnitChrome then syncPartyFrameUnitChrome() end
-      _EL.reapplyPartyBarColors()
-    end)
-    partyManaCheck:SetScript("OnEnter", function(s)
-      GameTooltip:SetOwner(s, "ANCHOR_RIGHT")
-      GameTooltip:SetText(L.TOOLTIP_OPT_SHOW_PARTY_MANA or "Draws a thin power bar above each party HP bar (mana, rage, energy, focus — whatever that unit uses). Color controls live on the Colors tab.", nil, nil, nil, nil, true)
-      GameTooltip:Show()
-    end)
-    partyManaCheck:SetScript("OnLeave", GameTooltip_Hide)
+    --- Show pet frames (|pet| / |partypetN| / |raidpetN|) inside their owner's subgroup. Triggers a
+    --- |updatePartyFrameSize| pass so the layout immediately grows / shrinks.
+    local petCheck = Wdg.CreateBooleanOption(parent, {
+      placeAfter = incHealCheck,
+      text = L.OPT_PARTY_SHOW_PETS or "Show pet frames",
+      textColor = { 0.85, 0.87, 0.90 },
+      onClick = function(self)
+        _EL.profileWrite(profileName, "partyShowPets", self:GetChecked() and true or false)
+        if EnemyListDB.activeProfileName == profileName and not InCombatLockdown() then
+          updatePartyFrameSize()
+        end
+      end,
+      tooltip = L.TOOLTIP_OPT_PARTY_SHOW_PETS or "Show party / raid member pets in their own frames, grouped with their owner.\n\nIncludes hunter pets, warlock minions, mage water elementals, DK ghouls, and your own pet. Toggling this on / off in combat queues until you leave combat (frame visibility is protected).",
+    })
+
+    --- Player buff icon strip (Renew, PW:Shield, Prayer of Mending, Lifebloom, Beacon, etc.).
+    local playerBuffsCheck = Wdg.CreateBooleanOption(parent, {
+      placeAfter = petCheck,
+      text = L.OPT_PARTY_PLAYER_BUFFS or "Show your own buffs (Renew, PW:Shield, ...)",
+      textColor = { 0.85, 0.87, 0.90 },
+      onClick = function(self)
+        _EL.profileWrite(profileName, "partyShowPlayerBuffs", self:GetChecked() and true or false)
+        if EnemyListDB.activeProfileName == profileName then
+          for _, uf2 in ipairs(partyUnitFrames) do
+            if _EL.updatePartyPlayerBuffs then _EL.updatePartyPlayerBuffs(uf2) end
+          end
+        end
+      end,
+      tooltip = L.TOOLTIP_OPT_PARTY_PLAYER_BUFFS or "Show icons of buffs cast by YOU on each party / raid member: Renew, Power Word: Shield, Prayer of Mending, Lifebloom, Rejuvenation, Beacon of Light, etc.\n\nOther casters' HoTs are filtered out — the strip stays focused on what you can refresh / extend.",
+    })
+
+    --- Slot count slider (1–8).
+    local playerBuffSlotsRow = CreateFrame("Frame", nil, parent)
+    playerBuffSlotsRow:SetSize(innerW, 42)
+    playerBuffSlotsRow:SetPoint("TOPLEFT", playerBuffsCheck, "BOTTOMLEFT", 0, -2)
+    local playerBuffSlotsSlider = createConfigOptionSlider(playerBuffSlotsRow, {
+      label = L.OPT_PARTY_PLAYER_BUFF_SLOTS or "Buff slots",
+      tooltip = L.TOOLTIP_OPT_PARTY_PLAYER_BUFF_SLOTS or "Maximum number of buff icons shown per frame (1–8). Anything beyond this count is dropped.",
+      min = 1, max = 8, step = 1, integer = true,
+      rowInnerWidth = innerW - 12,
+      format = function(v) return tostring(math.floor(v + 0.5)) end,
+      onChange = function(v)
+        _EL.profileWrite(profileName, "partyPlayerBuffSlotCount", math.max(1, math.min(8, math.floor(v + 0.5))))
+        if EnemyListDB.activeProfileName == profileName then
+          for _, uf2 in ipairs(partyUnitFrames) do
+            if _EL.updatePartyPlayerBuffs then _EL.updatePartyPlayerBuffs(uf2) end
+          end
+        end
+      end,
+      dbWriteGate = configSliderDbGate,
+    })
+
+    --- Icon size slider (8–32).
+    local playerBuffSizeRow = CreateFrame("Frame", nil, parent)
+    playerBuffSizeRow:SetSize(innerW, 42)
+    playerBuffSizeRow:SetPoint("TOPLEFT", playerBuffSlotsRow, "BOTTOMLEFT", 0, -2)
+    local playerBuffSizeSlider = createConfigOptionSlider(playerBuffSizeRow, {
+      label = L.OPT_PARTY_PLAYER_BUFF_SIZE or "Buff icon size",
+      tooltip = L.TOOLTIP_OPT_PARTY_PLAYER_BUFF_SIZE or "Pixel size of each buff icon (8–32). Icons shrink automatically if they don't fit the frame width.",
+      min = 8, max = 32, step = 1, integer = true,
+      rowInnerWidth = innerW - 12,
+      format = function(v) return tostring(math.floor(v + 0.5)) .. "px" end,
+      onChange = function(v)
+        _EL.profileWrite(profileName, "partyPlayerBuffIconSize", math.max(8, math.min(32, math.floor(v + 0.5))))
+        if EnemyListDB.activeProfileName == profileName then
+          for _, uf2 in ipairs(partyUnitFrames) do
+            if _EL.updatePartyPlayerBuffs then _EL.updatePartyPlayerBuffs(uf2) end
+          end
+        end
+      end,
+      dbWriteGate = configSliderDbGate,
+    })
+
+    --- Max duration filter (0 = no filter; >0 hides buffs longer than N seconds).
+    local playerBuffMaxDurRow = CreateFrame("Frame", nil, parent)
+    playerBuffMaxDurRow:SetSize(innerW, 42)
+    playerBuffMaxDurRow:SetPoint("TOPLEFT", playerBuffSizeRow, "BOTTOMLEFT", 0, -2)
+    local playerBuffMaxDurSlider = createConfigOptionSlider(playerBuffMaxDurRow, {
+      label = L.OPT_PARTY_PLAYER_BUFF_MAXDUR or "Max buff duration",
+      tooltip = L.TOOLTIP_OPT_PARTY_PLAYER_BUFF_MAXDUR or "Hide buffs whose base duration exceeds this many seconds. Use to filter out auras (Mark of the Wild, Power Word: Fortitude, blessings...) and only show short-duration buffs you actually refresh — HoTs, shields, etc.\n\nSet to |cffffcc000|r to disable the filter and show every buff you cast.",
+      min = 0, max = 600, step = 5, integer = true,
+      rowInnerWidth = innerW - 12,
+      format = function(v)
+        v = math.floor(v + 0.5)
+        if v == 0 then return L.OPT_VAL_OFF or "Off" end
+        if v >= 60 then return string.format("%dm", math.floor(v / 60)) end
+        return v .. "s"
+      end,
+      onChange = function(v)
+        _EL.profileWrite(profileName, "partyPlayerBuffMaxDuration", math.max(0, math.min(600, math.floor(v + 0.5))))
+        if EnemyListDB.activeProfileName == profileName then
+          for _, uf2 in ipairs(partyUnitFrames) do
+            if _EL.updatePartyPlayerBuffs then _EL.updatePartyPlayerBuffs(uf2) end
+          end
+        end
+      end,
+      dbWriteGate = configSliderDbGate,
+    })
+
+    --- Bar edge position (each bar independent: Bottom/Top/Left/Right). Displayed as a row of
+    --- 4 small buttons per bar; the active edge is highlighted. Reused by HP/mana bar pickers below.
+    local POS_ORDER = { "bottom", "top", "left", "right" }
+    local POS_LABEL = {
+      bottom = L.OPT_BAR_POS_BOTTOM or "Bottom",
+      top    = L.OPT_BAR_POS_TOP    or "Top",
+      left   = L.OPT_BAR_POS_LEFT   or "Left",
+      right  = L.OPT_BAR_POS_RIGHT  or "Right",
+    }
+
+    --- Position selector for the buff strip — top/bottom run horizontal, left/right run vertical.
+    local function refreshPlayerBuffsAllFrames()
+      if EnemyListDB.activeProfileName == profileName then
+        for _, uf2 in ipairs(partyUnitFrames) do
+          if _EL.updatePartyPlayerBuffs then _EL.updatePartyPlayerBuffs(uf2) end
+        end
+      end
+    end
+    local playerBuffPosRow, playerBuffPosRefresh = Wdg.CreateStyleButtonRow(parent, {
+      placeAfter = playerBuffMaxDurRow,
+      offsetX = 0,
+      offsetY = -4,
+      rowWidth = innerW,
+      titleText = L.OPT_PARTY_PLAYER_BUFF_POS or "Buff position",
+      ids = POS_ORDER,
+      getLabel = function(id) return POS_LABEL[id] or id end,
+      getCurrent = function() return _EL.partyPlayerBuffAnchor() end,
+      onPick = function(id)
+        _EL.profileWrite(profileName, "partyPlayerBuffAnchor", id)
+        refreshPlayerBuffsAllFrames()
+      end,
+      tooltip = L.TOOLTIP_OPT_PARTY_PLAYER_BUFF_POS or "Where the buff icon strip sits on each frame. Top / Bottom run horizontally; Left / Right stack vertically.",
+    })
+    if playerBuffPosRow and configFrame and configFrame._elConfigPositionRows then
+      playerBuffPosRow._updateSelection = playerBuffPosRefresh
+      table.insert(configFrame._elConfigPositionRows, playerBuffPosRow)
+    end
+
+    --- Pixel offset sliders (X / Y) so the user can nudge the strip away from the frame edge.
+    local playerBuffOffsetXRow = CreateFrame("Frame", nil, parent)
+    playerBuffOffsetXRow:SetSize(innerW, 42)
+    playerBuffOffsetXRow:SetPoint("TOPLEFT", playerBuffPosRow, "BOTTOMLEFT", 0, -2)
+    local playerBuffOffsetXSlider = createConfigOptionSlider(playerBuffOffsetXRow, {
+      label = L.OPT_PARTY_PLAYER_BUFF_OFFSET_X or "Buff offset X",
+      tooltip = L.TOOLTIP_OPT_PARTY_PLAYER_BUFF_OFFSET_X or "Horizontal nudge in pixels (-50..50). Useful when the buff strip overlaps the HP deficit text or aggro count.",
+      min = -50, max = 50, step = 1, integer = true,
+      rowInnerWidth = innerW - 12,
+      format = function(v) return tostring(math.floor(v + 0.5)) .. "px" end,
+      onChange = function(v)
+        _EL.profileWrite(profileName, "partyPlayerBuffOffsetX", math.max(-50, math.min(50, math.floor(v + 0.5))))
+        refreshPlayerBuffsAllFrames()
+      end,
+      dbWriteGate = configSliderDbGate,
+    })
+
+    local playerBuffOffsetYRow = CreateFrame("Frame", nil, parent)
+    playerBuffOffsetYRow:SetSize(innerW, 42)
+    playerBuffOffsetYRow:SetPoint("TOPLEFT", playerBuffOffsetXRow, "BOTTOMLEFT", 0, -2)
+    local playerBuffOffsetYSlider = createConfigOptionSlider(playerBuffOffsetYRow, {
+      label = L.OPT_PARTY_PLAYER_BUFF_OFFSET_Y or "Buff offset Y",
+      tooltip = L.TOOLTIP_OPT_PARTY_PLAYER_BUFF_OFFSET_Y or "Vertical nudge in pixels (-50..50).",
+      min = -50, max = 50, step = 1, integer = true,
+      rowInnerWidth = innerW - 12,
+      format = function(v) return tostring(math.floor(v + 0.5)) .. "px" end,
+      onChange = function(v)
+        _EL.profileWrite(profileName, "partyPlayerBuffOffsetY", math.max(-50, math.min(50, math.floor(v + 0.5))))
+        refreshPlayerBuffsAllFrames()
+      end,
+      dbWriteGate = configSliderDbGate,
+    })
+
+    local partyManaCheck = Wdg.CreateBooleanOption(parent, {
+      placeAfter = playerBuffOffsetYRow,
+      text = L.OPT_SHOW_PARTY_MANA,
+      textColor = { 0.85, 0.87, 0.90 },
+      onClick = function(self)
+        _EL.profileWrite(profileName, "showPartyManaBars", self:GetChecked() and true or false)
+        if EnemyListDB.activeProfileName == profileName and syncPartyFrameUnitChrome then syncPartyFrameUnitChrome() end
+        _EL.reapplyPartyBarColors()
+      end,
+      tooltip = L.TOOLTIP_OPT_SHOW_PARTY_MANA,
+    })
 
     --- Mana bar height — lives here next to the "Show mana bar" toggle so related settings are
     --- adjacent (used to live on the Colors tab).
     local partyManaHeightRow = CreateFrame("Frame", nil, parent)
     partyManaHeightRow:SetSize(innerW, 42)
-    partyManaHeightRow:SetPoint("TOPLEFT", partyManaCheck, "BOTTOMLEFT", 6, -2)
+    partyManaHeightRow:SetPoint("TOPLEFT", partyManaCheck, "BOTTOMLEFT", 0, -2)
     local partyManaHeightSlider = createConfigOptionSlider(partyManaHeightRow, {
       label = L.OPT_PARTY_MANA_BAR_HEIGHT or "Mana bar height",
       tooltip = L.TOOLTIP_OPT_PARTY_MANA_BAR_HEIGHT or "Height of the mana/power bar in pixels (2–40).",
       min = 2, max = 40, step = 1, integer = true,
-      rowInnerWidth = innerW - 12,
+      rowInnerWidth = innerW,
       format = function(v) return tostring(math.floor(v + 0.5)) .. "px" end,
       onChange = function(v)
         _EL.profileWrite(profileName, "partyManaBarHeight", math.max(2, math.min(40, math.floor(v + 0.5))))
@@ -6864,79 +7807,35 @@ local function createConfigFrame()
       dbWriteGate = configSliderDbGate,
     })
 
-    --- Bar edge position (each bar independent: Bottom/Top/Left/Right). Displayed as a row of
-    --- 4 small buttons per bar; the active edge is highlighted.
-    local POS_ORDER = { "bottom", "top", "left", "right" }
-    local POS_LABEL = {
-      bottom = L.OPT_BAR_POS_BOTTOM or "Bottom",
-      top    = L.OPT_BAR_POS_TOP    or "Top",
-      left   = L.OPT_BAR_POS_LEFT   or "Left",
-      right  = L.OPT_BAR_POS_RIGHT  or "Right",
-    }
-    local bdMixinPos = (type(BackdropTemplateMixin) == "table") and "BackdropTemplate" or nil
+    --- POS_ORDER / POS_LABEL hoisted to before the player-buff position row above (declared earlier
+    --- in this function so the buff position selector can reuse them).
     local function buildPositionRow(anchorAbove, title, tooltip, dbKey, profileDbKey, getCurrent)
-      local row = CreateFrame("Frame", nil, parent)
-      row:SetSize(innerW - 12, 36)
-      row:SetPoint("TOPLEFT", anchorAbove, "BOTTOMLEFT", 0, -4)
-      local lbl = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-      lbl:SetPoint("TOPLEFT", row, "TOPLEFT", 4, 0)
-      lbl:SetTextColor(0.74, 0.77, 0.82)
-      lbl:SetText(title)
-      local btns = {}
-      local btnW = math.floor((innerW - 12 - 8 - (#POS_ORDER - 1) * 2) / #POS_ORDER)
-      local function updateSelection()
-        local cur = getCurrent()
-        for i, pos in ipairs(POS_ORDER) do
-          local b = btns[i]
-          if b then
-            local active = (pos == cur)
-            if b.SetBackdropColor then
-              b:SetBackdropColor(0.12, 0.12, 0.14, 0.9)
-              if active then
-                b:SetBackdropBorderColor(1, 0.82, 0, 0.9)
-              else
-                b:SetBackdropBorderColor(0.3, 0.3, 0.3, 0.6)
-              end
-            end
-            local fs = b:GetFontString()
-            if fs then fs:SetTextColor(active and 1 or 0.7, active and 0.82 or 0.72, active and 0 or 0.75) end
+      local row, updateSelection = Wdg.CreateStyleButtonRow(parent, {
+        placeAfter = anchorAbove,
+        offsetX = 0,
+        offsetY = -4,
+        rowWidth = innerW,
+        titleText = title,
+        ids = POS_ORDER,
+        getLabel = function(id)
+          return POS_LABEL[id] or id
+        end,
+        getCurrent = getCurrent,
+        onPick = function(id)
+          _EL.profileWrite(profileName, profileDbKey, id)
+          if EnemyListDB.activeProfileName == profileName and syncPartyFrameUnitChrome then
+            syncPartyFrameUnitChrome()
           end
-        end
-      end
-      for i, pos in ipairs(POS_ORDER) do
-        local b = CreateFrame("Button", nil, row, bdMixinPos)
-        b:SetSize(btnW, 20)
-        b:SetPoint("TOPLEFT", row, "TOPLEFT", 4 + (i - 1) * (btnW + 2), -16)
-        if b.SetBackdrop then
-          b:SetBackdrop({
-            bgFile = "Interface\\Buttons\\WHITE8X8",
-            edgeFile = "Interface\\Buttons\\WHITE8X8",
-            edgeSize = 1,
-            insets = { left = 1, right = 1, top = 1, bottom = 1 },
-          })
-        end
-        b:SetNormalFontObject("GameFontNormalSmall")
-        local fs = b:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-        fs:SetPoint("CENTER")
-        fs:SetText(POS_LABEL[pos])
-        b:SetFontString(fs)
-        b:SetScript("OnClick", function()
-          _EL.profileWrite(profileName, profileDbKey, pos)
-          updateSelection()
-          if EnemyListDB.activeProfileName == profileName and syncPartyFrameUnitChrome then syncPartyFrameUnitChrome() end
           updatePartyFrameSize()
-        end)
-        b:SetScript("OnEnter", function(self)
-          GameTooltip:SetOwner(self, "ANCHOR_TOP")
-          GameTooltip:SetText(tooltip, nil, nil, nil, nil, true)
-          GameTooltip:Show()
-        end)
-        b:SetScript("OnLeave", GameTooltip_Hide)
-        btns[i] = b
+        end,
+        tooltip = tooltip,
+      })
+      if row then
+        row._updateSelection = updateSelection
+        if configFrame and configFrame._elConfigPositionRows then
+          table.insert(configFrame._elConfigPositionRows, row)
+        end
       end
-      updateSelection()
-      row._updateSelection = updateSelection
-      row._btns = btns
       return row, updateSelection
     end
 
@@ -6955,30 +7854,26 @@ local function createConfigFrame()
       function() return _EL.partyManaBarPosition() end)
 
     --- Unit name overlay.
-    local nameCheck = CreateFrame("CheckButton", nil, parent, "UICheckButtonTemplate")
-    nameCheck:SetPoint("TOPLEFT", manaPosRow, "BOTTOMLEFT", 0, -4)
-    local nameCheckText = setCheckButtonLabel(nameCheck, L.OPT_PARTY_SHOW_NAME or "Show unit name")
-    if nameCheckText then nameCheckText:SetTextColor(0.85, 0.87, 0.90) end
-    nameCheck:SetScript("OnClick", function(self)
-      _EL.profileWrite(profileName, "partyFrameShowName", self:GetChecked() and true or false)
-      if EnemyListDB.activeProfileName == profileName and syncPartyFrameUnitChrome then syncPartyFrameUnitChrome() end
-      _EL.reapplyPartyBarColors()
-    end)
-    nameCheck:SetScript("OnEnter", function(s)
-      GameTooltip:SetOwner(s, "ANCHOR_RIGHT")
-      GameTooltip:SetText(L.TOOLTIP_OPT_PARTY_SHOW_NAME or "Show each unit's name centered at the top of its party frame. Class-colored when available.", nil, nil, nil, nil, true)
-      GameTooltip:Show()
-    end)
-    nameCheck:SetScript("OnLeave", GameTooltip_Hide)
+    local nameCheck = Wdg.CreateBooleanOption(parent, {
+      placeAfter = manaPosRow,
+      text = L.OPT_PARTY_SHOW_NAME,
+      textColor = { 0.85, 0.87, 0.90 },
+      onClick = function(self)
+        _EL.profileWrite(profileName, "partyFrameShowName", self:GetChecked() and true or false)
+        if EnemyListDB.activeProfileName == profileName and syncPartyFrameUnitChrome then syncPartyFrameUnitChrome() end
+        _EL.reapplyPartyBarColors()
+      end,
+      tooltip = L.TOOLTIP_OPT_PARTY_SHOW_NAME,
+    })
 
     local nameFontRow = CreateFrame("Frame", nil, parent)
     nameFontRow:SetSize(innerW, 42)
-    nameFontRow:SetPoint("TOPLEFT", nameCheck, "BOTTOMLEFT", 6, -2)
+    nameFontRow:SetPoint("TOPLEFT", nameCheck, "BOTTOMLEFT", 0, -2)
     local nameFontScaleSlider = createConfigOptionSlider(nameFontRow, {
       label = L.OPT_PARTY_NAME_FONT_SCALE or "Name text size",
       tooltip = L.TOOLTIP_OPT_PARTY_NAME_FONT_SCALE or "Scales the unit-name text on party frames (50%–200%).",
       min = 0.5, max = 2.0, step = 0.05, integer = false,
-      rowInnerWidth = innerW - 12,
+      rowInnerWidth = innerW,
       format = function(v) return string.format("%d%%", math.floor(v * 100 + 0.5)) end,
       onChange = function(v)
         _EL.profileWrite(profileName, "partyFrameNameFontScale", math.max(0.5, math.min(2.0, v)))
@@ -6995,77 +7890,44 @@ local function createConfigFrame()
       middle = L.OPT_NAME_POS_MIDDLE or "Middle",
       bottom = L.OPT_NAME_POS_BOTTOM or "Bottom",
     }
-    local namePosRow = CreateFrame("Frame", nil, parent)
-    namePosRow:SetSize(innerW - 12, 36)
-    namePosRow:SetPoint("TOPLEFT", nameFontRow, "BOTTOMLEFT", -6, -4)
-    local namePosLbl = namePosRow:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    namePosLbl:SetPoint("TOPLEFT", namePosRow, "TOPLEFT", 4, 0)
-    namePosLbl:SetTextColor(0.74, 0.77, 0.82)
-    namePosLbl:SetText(L.OPT_PARTY_NAME_POS or "Name position")
-    local namePosBtns = {}
-    local namePosBtnW = math.floor((innerW - 12 - 8 - (#NAME_POS_ORDER - 1) * 2) / #NAME_POS_ORDER)
-    local function updateNamePosSelection()
-      local cur = _EL.partyFrameNamePosition()
-      for i, pos in ipairs(NAME_POS_ORDER) do
-        local b = namePosBtns[i]
-        if b then
-          local active = (pos == cur)
-          if b.SetBackdropColor then
-            b:SetBackdropColor(0.12, 0.12, 0.14, 0.9)
-            if active then
-              b:SetBackdropBorderColor(1, 0.82, 0, 0.9)
-            else
-              b:SetBackdropBorderColor(0.3, 0.3, 0.3, 0.6)
-            end
-          end
-          local fs = b:GetFontString()
-          if fs then fs:SetTextColor(active and 1 or 0.7, active and 0.82 or 0.72, active and 0 or 0.75) end
+    local namePosRow, namePosRefresh = Wdg.CreateStyleButtonRow(parent, {
+      placeAfter = nameFontRow,
+      offsetX = 0,
+      offsetY = -4,
+      rowWidth = innerW,
+      titleText = L.OPT_PARTY_NAME_POS or "Name position",
+      ids = NAME_POS_ORDER,
+      getLabel = function(id)
+        return NAME_POS_LABEL[id] or id
+      end,
+      getCurrent = function()
+        return _EL.partyFrameNamePosition()
+      end,
+      onPick = function(id)
+        _EL.profileWrite(profileName, "partyFrameNamePosition", id)
+        if EnemyListDB.activeProfileName == profileName and syncPartyFrameUnitChrome then
+          syncPartyFrameUnitChrome()
         end
-      end
+      end,
+      tooltip = L.TOOLTIP_OPT_PARTY_NAME_POS
+        or "Where the unit name sits on each party frame. 'Top' overlaps the debuff strip — pick 'Bottom' or 'Middle' if you run with debuffs on.",
+    })
+    if namePosRow and namePosRefresh and configFrame and configFrame._elConfigPositionRows then
+      namePosRow._updateSelection = namePosRefresh
+      table.insert(configFrame._elConfigPositionRows, namePosRow)
     end
-    local namePosBdMixin = (type(BackdropTemplateMixin) == "table") and "BackdropTemplate" or nil
-    for i, pos in ipairs(NAME_POS_ORDER) do
-      local b = CreateFrame("Button", nil, namePosRow, namePosBdMixin)
-      b:SetSize(namePosBtnW, 20)
-      b:SetPoint("TOPLEFT", namePosRow, "TOPLEFT", 4 + (i - 1) * (namePosBtnW + 2), -16)
-      if b.SetBackdrop then
-        b:SetBackdrop({
-          bgFile = "Interface\\Buttons\\WHITE8X8",
-          edgeFile = "Interface\\Buttons\\WHITE8X8",
-          edgeSize = 1,
-          insets = { left = 1, right = 1, top = 1, bottom = 1 },
-        })
-      end
-      local fs = b:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-      fs:SetPoint("CENTER")
-      fs:SetText(NAME_POS_LABEL[pos])
-      b:SetFontString(fs)
-      b:SetScript("OnClick", function()
-        _EL.profileWrite(profileName, "partyFrameNamePosition", pos)
-        updateNamePosSelection()
-        if EnemyListDB.activeProfileName == profileName and syncPartyFrameUnitChrome then syncPartyFrameUnitChrome() end
-      end)
-      b:SetScript("OnEnter", function(self)
-        GameTooltip:SetOwner(self, "ANCHOR_TOP")
-        GameTooltip:SetText(L.TOOLTIP_OPT_PARTY_NAME_POS or "Where the unit name sits on each party frame. 'Top' overlaps the debuff strip — pick 'Bottom' or 'Middle' if you run with debuffs on.", nil, nil, nil, nil, true)
-        GameTooltip:Show()
-      end)
-      b:SetScript("OnLeave", GameTooltip_Hide)
-      namePosBtns[i] = b
-    end
-    updateNamePosSelection()
 
     --- Pixel offsets for the name label so users can fine-tune position beyond the 3-way radio.
     --- +X = right, +Y = up (WoW convention). Range kept tight (±50px) so a stray drag can't fling
     --- the label off-frame.
     local nameOffsetXRow = CreateFrame("Frame", nil, parent)
     nameOffsetXRow:SetSize(innerW, 42)
-    nameOffsetXRow:SetPoint("TOPLEFT", namePosRow, "BOTTOMLEFT", 6, -4)
+    nameOffsetXRow:SetPoint("TOPLEFT", namePosRow, "BOTTOMLEFT", 0, -4)
     local nameOffsetXSlider = createConfigOptionSlider(nameOffsetXRow, {
       label = L.OPT_PARTY_NAME_OFFSET_X or "Name X offset",
       tooltip = L.TOOLTIP_OPT_PARTY_NAME_OFFSET_X or "Horizontal pixel offset from the selected position. Positive = right, negative = left.",
       min = -50, max = 50, step = 1, integer = true,
-      rowInnerWidth = innerW - 12,
+      rowInnerWidth = innerW,
       format = function(v) local n = math.floor(v + 0.5); return (n > 0 and "+" or "") .. n .. "px" end,
       onChange = function(v)
         _EL.profileWrite(profileName, "partyFrameNameOffsetX", math.max(-50, math.min(50, math.floor(v + 0.5))))
@@ -7081,7 +7943,7 @@ local function createConfigFrame()
       label = L.OPT_PARTY_NAME_OFFSET_Y or "Name Y offset",
       tooltip = L.TOOLTIP_OPT_PARTY_NAME_OFFSET_Y or "Vertical pixel offset from the selected position. Positive = up, negative = down.",
       min = -50, max = 50, step = 1, integer = true,
-      rowInnerWidth = innerW - 12,
+      rowInnerWidth = innerW,
       format = function(v) local n = math.floor(v + 0.5); return (n > 0 and "+" or "") .. n .. "px" end,
       onChange = function(v)
         _EL.profileWrite(profileName, "partyFrameNameOffsetY", math.max(-50, math.min(50, math.floor(v + 0.5))))
@@ -7091,29 +7953,25 @@ local function createConfigFrame()
     })
 
     --- Low-HP flash section.
-    local lowHpCheck = CreateFrame("CheckButton", nil, parent, "UICheckButtonTemplate")
-    lowHpCheck:SetPoint("TOPLEFT", nameOffsetYRow, "BOTTOMLEFT", -6, -4)
-    local lowHpCheckText = setCheckButtonLabel(lowHpCheck, L.OPT_PARTY_LOW_HP_FLASH or "Flash border on low HP")
-    if lowHpCheckText then lowHpCheckText:SetTextColor(0.85, 0.87, 0.90) end
-    lowHpCheck:SetScript("OnClick", function(self)
-      _EL.profileWrite(profileName, "partyLowHpFlashEnabled", self:GetChecked() and true or false)
-      _EL.reapplyPartyBarColors()
-    end)
-    lowHpCheck:SetScript("OnEnter", function(s)
-      GameTooltip:SetOwner(s, "ANCHOR_RIGHT")
-      GameTooltip:SetText(L.TOOLTIP_OPT_PARTY_LOW_HP_FLASH or "Pulse the frame border in the 'low HP flash' color (Colors tab) when a unit drops below the threshold.", nil, nil, nil, nil, true)
-      GameTooltip:Show()
-    end)
-    lowHpCheck:SetScript("OnLeave", GameTooltip_Hide)
+    local lowHpCheck = Wdg.CreateBooleanOption(parent, {
+      placeAfter = nameOffsetYRow,
+      text = L.OPT_PARTY_LOW_HP_FLASH,
+      textColor = { 0.85, 0.87, 0.90 },
+      onClick = function(self)
+        _EL.profileWrite(profileName, "partyLowHpFlashEnabled", self:GetChecked() and true or false)
+        _EL.reapplyPartyBarColors()
+      end,
+      tooltip = L.TOOLTIP_OPT_PARTY_LOW_HP_FLASH,
+    })
 
     local lowHpRow = CreateFrame("Frame", nil, parent)
     lowHpRow:SetSize(innerW, 42)
-    lowHpRow:SetPoint("TOPLEFT", lowHpCheck, "BOTTOMLEFT", 6, -2)
+    lowHpRow:SetPoint("TOPLEFT", lowHpCheck, "BOTTOMLEFT", 0, -2)
     local lowHpThresholdSlider = createConfigOptionSlider(lowHpRow, {
       label = L.OPT_PARTY_LOW_HP_THRESHOLD or "Low HP threshold",
       tooltip = L.TOOLTIP_OPT_PARTY_LOW_HP_THRESHOLD or "HP percentage at or below which the flash kicks in.",
       min = 5, max = 95, step = 1, integer = true,
-      rowInnerWidth = innerW - 12,
+      rowInnerWidth = innerW,
       format = function(v) return string.format("%d%%", math.floor(v + 0.5)) end,
       onChange = function(v)
         _EL.profileWrite(profileName, "partyLowHpThreshold", math.max(5, math.min(95, math.floor(v + 0.5))))
@@ -7122,29 +7980,25 @@ local function createConfigFrame()
     })
 
     --- Low-Mana flash section.
-    local lowManaCheck = CreateFrame("CheckButton", nil, parent, "UICheckButtonTemplate")
-    lowManaCheck:SetPoint("TOPLEFT", lowHpRow, "BOTTOMLEFT", -6, -4)
-    local lowManaCheckText = setCheckButtonLabel(lowManaCheck, L.OPT_PARTY_LOW_MANA_FLASH or "Flash border on low mana")
-    if lowManaCheckText then lowManaCheckText:SetTextColor(0.85, 0.87, 0.90) end
-    lowManaCheck:SetScript("OnClick", function(self)
-      _EL.profileWrite(profileName, "partyLowManaFlashEnabled", self:GetChecked() and true or false)
-      _EL.reapplyPartyBarColors()
-    end)
-    lowManaCheck:SetScript("OnEnter", function(s)
-      GameTooltip:SetOwner(s, "ANCHOR_RIGHT")
-      GameTooltip:SetText(L.TOOLTIP_OPT_PARTY_LOW_MANA_FLASH or "Pulse the frame border in the 'low mana flash' color (Colors tab) when a mana-using unit drops below the threshold. HP flash takes priority when both are low.", nil, nil, nil, nil, true)
-      GameTooltip:Show()
-    end)
-    lowManaCheck:SetScript("OnLeave", GameTooltip_Hide)
+    local lowManaCheck = Wdg.CreateBooleanOption(parent, {
+      placeAfter = lowHpRow,
+      text = L.OPT_PARTY_LOW_MANA_FLASH,
+      textColor = { 0.85, 0.87, 0.90 },
+      onClick = function(self)
+        _EL.profileWrite(profileName, "partyLowManaFlashEnabled", self:GetChecked() and true or false)
+        _EL.reapplyPartyBarColors()
+      end,
+      tooltip = L.TOOLTIP_OPT_PARTY_LOW_MANA_FLASH,
+    })
 
     local lowManaRow = CreateFrame("Frame", nil, parent)
     lowManaRow:SetSize(innerW, 42)
-    lowManaRow:SetPoint("TOPLEFT", lowManaCheck, "BOTTOMLEFT", 6, -2)
+    lowManaRow:SetPoint("TOPLEFT", lowManaCheck, "BOTTOMLEFT", 0, -2)
     local lowManaThresholdSlider = createConfigOptionSlider(lowManaRow, {
       label = L.OPT_PARTY_LOW_MANA_THRESHOLD or "Low mana threshold",
       tooltip = L.TOOLTIP_OPT_PARTY_LOW_MANA_THRESHOLD or "Mana percentage at or below which the flash kicks in.",
       min = 5, max = 95, step = 1, integer = true,
-      rowInnerWidth = innerW - 12,
+      rowInnerWidth = innerW,
       format = function(v) return string.format("%d%%", math.floor(v + 0.5)) end,
       onChange = function(v)
         _EL.profileWrite(profileName, "partyLowManaThreshold", math.max(5, math.min(95, math.floor(v + 0.5))))
@@ -7154,33 +8008,29 @@ local function createConfigFrame()
 
     --- Role icon toggle + size slider. Classic/Anniversary can only resolve MAINTANK (GetPartyAssignment);
     --- Retail uses |UnitGroupRolesAssigned|. Test mode cycles fake roles so the feature previews on any client.
-    local roleIconCheck = CreateFrame("CheckButton", nil, parent, "UICheckButtonTemplate")
-    roleIconCheck:SetPoint("TOPLEFT", lowManaRow, "BOTTOMLEFT", -6, -4)
-    local roleIconText = setCheckButtonLabel(roleIconCheck, L.OPT_PARTY_SHOW_ROLE_ICON or "Show role icon (tank/healer/DPS)")
-    if roleIconText then roleIconText:SetTextColor(0.85, 0.87, 0.90) end
-    roleIconCheck:SetScript("OnClick", function(self)
-      _EL.profileWrite(profileName, "partyShowRoleIcon", self:GetChecked() and true or false)
-      if EnemyListDB.activeProfileName == profileName then
-        for _, uf2 in ipairs(partyUnitFrames) do
-          if uf2._elUnit and _EL.updatePartyUnitFrame then _EL.updatePartyUnitFrame(uf2) end
+    local roleIconCheck = Wdg.CreateBooleanOption(parent, {
+      placeAfter = lowManaRow,
+      text = L.OPT_PARTY_SHOW_ROLE_ICON,
+      textColor = { 0.85, 0.87, 0.90 },
+      onClick = function(self)
+        _EL.profileWrite(profileName, "partyShowRoleIcon", self:GetChecked() and true or false)
+        if EnemyListDB.activeProfileName == profileName then
+          for _, uf2 in ipairs(partyUnitFrames) do
+            if uf2._elUnit and _EL.updatePartyUnitFrame then _EL.updatePartyUnitFrame(uf2) end
+          end
         end
-      end
-    end)
-    roleIconCheck:SetScript("OnEnter", function(s)
-      GameTooltip:SetOwner(s, "ANCHOR_RIGHT")
-      GameTooltip:SetText(L.TOOLTIP_OPT_PARTY_SHOW_ROLE_ICON or "Show a tank / healer / damager badge in the top-left corner of each party frame.\n\nOn Classic/Anniversary only raid main-tank assignments resolve (via /mt); Retail uses the LFG role. Test mode cycles fake roles so the feature is previewable.", nil, nil, nil, nil, true)
-      GameTooltip:Show()
-    end)
-    roleIconCheck:SetScript("OnLeave", GameTooltip_Hide)
+      end,
+      tooltip = L.TOOLTIP_OPT_PARTY_SHOW_ROLE_ICON,
+    })
 
     local roleIconSizeRow = CreateFrame("Frame", nil, parent)
     roleIconSizeRow:SetSize(innerW, 42)
-    roleIconSizeRow:SetPoint("TOPLEFT", roleIconCheck, "BOTTOMLEFT", 6, -2)
+    roleIconSizeRow:SetPoint("TOPLEFT", roleIconCheck, "BOTTOMLEFT", 0, -2)
     local roleIconSizeSlider = createConfigOptionSlider(roleIconSizeRow, {
       label = L.OPT_PARTY_ROLE_ICON_SIZE or "Role icon size",
       tooltip = L.TOOLTIP_OPT_PARTY_ROLE_ICON_SIZE or "Pixel size of the role icon (6–32).",
       min = 6, max = 32, step = 1, integer = true,
-      rowInnerWidth = innerW - 12,
+      rowInnerWidth = innerW,
       format = function(v) return tostring(math.floor(v + 0.5)) .. "px" end,
       onChange = function(v)
         _EL.profileWrite(profileName, "partyRoleIconSize", math.max(6, math.min(32, math.floor(v + 0.5))))
@@ -7210,8 +8060,28 @@ local function createConfigFrame()
     configFrame._elDisplaySliders[#configFrame._elDisplaySliders + 1] = aggroCountOffsetYSlider
     configFrame._elDisplaySliders[#configFrame._elDisplaySliders + 1] = aggroBorderThicknessSlider
     configFrame._elDisplaySliders[#configFrame._elDisplaySliders + 1] = roleIconSizeSlider
+    configFrame._elDisplaySliders[#configFrame._elDisplaySliders + 1] = playerBuffSlotsSlider
+    configFrame._elDisplaySliders[#configFrame._elDisplaySliders + 1] = playerBuffSizeSlider
+    configFrame._elDisplaySliders[#configFrame._elDisplaySliders + 1] = playerBuffMaxDurSlider
+    configFrame._elDisplaySliders[#configFrame._elDisplaySliders + 1] = playerBuffOffsetXSlider
+    configFrame._elDisplaySliders[#configFrame._elDisplaySliders + 1] = playerBuffOffsetYSlider
+
+    --- Slider / segmented rows must track |_elInnerW| on resize (same as Appearance |_elWideRows|).
+    if configFrame and configFrame._elWideRows then
+      for _, wrow in ipairs({
+        topMark,
+        partySizeRow, unitGapRow, groupGapRow, partyHpDeficitFontScaleRow, partyHpBarRow, partyAggroFontScaleRow,
+        aggroCountOffsetXRow, aggroCountOffsetYRow, aggroBorderThicknessRow, partyManaHeightRow,
+        hpPosRow, manaPosRow, nameFontRow, namePosRow, nameOffsetXRow, nameOffsetYRow, lowHpRow, lowManaRow, roleIconSizeRow,
+      }) do
+        if wrow and wrow.SetWidth then
+          table.insert(configFrame._elWideRows, wrow)
+        end
+      end
+    end
 
     return {
+      topMark                    = topMark,
       profileName               = profileName,
       partyCheck                = partyCheck,
       partySizeSlider           = partySizeSlider,
@@ -7225,13 +8095,21 @@ local function createConfigFrame()
       partyAggroCountFontScale  = partyAggroCountFontScaleSlider,
       partySelfCountCheck       = partySelfCountCheck,
       incHealCheck              = incHealCheck,
+      petCheck                  = petCheck,
+      playerBuffsCheck          = playerBuffsCheck,
+      playerBuffSlotsSlider     = playerBuffSlotsSlider,
+      playerBuffSizeSlider      = playerBuffSizeSlider,
+      playerBuffMaxDurSlider    = playerBuffMaxDurSlider,
+      playerBuffPosRefresh      = playerBuffPosRefresh,
+      playerBuffOffsetXSlider   = playerBuffOffsetXSlider,
+      playerBuffOffsetYSlider   = playerBuffOffsetYSlider,
       partyManaCheck            = partyManaCheck,
       partyManaHeightSlider     = partyManaHeightSlider,
       hpPosRefresh              = hpPosRefresh,
       manaPosRefresh            = manaPosRefresh,
       nameCheck                 = nameCheck,
       nameFontScaleSlider       = nameFontScaleSlider,
-      namePosRefresh            = updateNamePosSelection,
+      namePosRefresh            = namePosRefresh,
       nameOffsetXSlider         = nameOffsetXSlider,
       nameOffsetYSlider         = nameOffsetYSlider,
       aggroCountOffsetXSlider   = aggroCountOffsetXSlider,
@@ -7250,6 +8128,7 @@ local function createConfigFrame()
   end
 
   --- Party tab content (scrollChild3): edits the party profile regardless of which is active.
+  configFrame._elConfigPositionRows = {}
   configFrame._elPartyPanel = buildPartyFramePanel(scrollChild3, "party", {
     title = L.CONFIG_SECTION_PARTY or "Party Frames (Party profile)",
     desc  = L.CONFIG_PARTY_DESC or "Settings on this tab always save to the Party profile. Live preview only runs when the Party profile is active; in a raid, changes are queued until you leave.",
@@ -7262,9 +8141,12 @@ local function createConfigFrame()
 
   --- Colors tab content (scrollChild4). Holds the RGB swatches that used to live on the Party tab.
   do
+    local Wb = EnemyList.ConfigWidgets
+    configFrame._elConfigColorSwatchRows = {}
     local colorsTopMark = CreateFrame("Frame", nil, scrollChild4)
     colorsTopMark:SetSize(innerW, 1)
     colorsTopMark:SetPoint("TOPLEFT", scrollChild4, "TOPLEFT", 0, 0)
+    configFrame._elColorsTopMark = colorsTopMark
 
     local colorsTitle = scrollChild4:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
     colorsTitle:SetPoint("TOPLEFT", colorsTopMark, "TOPLEFT", 6, -6)
@@ -7278,11 +8160,12 @@ local function createConfigFrame()
     colorsDesc:SetWordWrap(true)
     colorsDesc:SetTextColor(0.62, 0.65, 0.69)
     colorsDesc:SetText(L.CONFIG_COLORS_DESC or "All color settings live here. Changes are saved to the active profile (see Profiles tab).")
+    configFrame._elColorsDesc = colorsDesc
 
-    --- HP deficit text color.
+    --- HP deficit text color. Same horizontal inset as |makeColorRow| (8px from scroll edge).
     local rowHpDeficitTextCol = CreateFrame("Frame", nil, scrollChild4)
-    rowHpDeficitTextCol:SetSize(innerW - 24, 22)
-    rowHpDeficitTextCol:SetPoint("TOPLEFT", colorsDesc, "BOTTOMLEFT", 6, -12)
+    rowHpDeficitTextCol:SetSize(innerW - 16, 22)
+    rowHpDeficitTextCol:SetPoint("TOPLEFT", colorsDesc, "BOTTOMLEFT", 8, -12)
     local lblHpDeficitText = rowHpDeficitTextCol:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
     lblHpDeficitText:SetPoint("LEFT", rowHpDeficitTextCol, "LEFT", 0, 0)
     lblHpDeficitText:SetTextColor(0.7, 0.72, 0.75)
@@ -7319,7 +8202,7 @@ local function createConfigFrame()
 
     --- HP deficit shadow/border color.
     local rowHpDeficitBorderCol = CreateFrame("Frame", nil, scrollChild4)
-    rowHpDeficitBorderCol:SetSize(innerW - 24, 22)
+    rowHpDeficitBorderCol:SetSize(innerW - 16, 22)
     rowHpDeficitBorderCol:SetPoint("TOPLEFT", rowHpDeficitTextCol, "BOTTOMLEFT", 0, -6)
     local lblHpDeficitBorder = rowHpDeficitBorderCol:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
     lblHpDeficitBorder:SetPoint("LEFT", rowHpDeficitBorderCol, "LEFT", 0, 0)
@@ -7357,7 +8240,7 @@ local function createConfigFrame()
 
     --- Aggro count color (centre digit on party frame).
     local rowAggroCountCol = CreateFrame("Frame", nil, scrollChild4)
-    rowAggroCountCol:SetSize(innerW - 24, 22)
+    rowAggroCountCol:SetSize(innerW - 16, 22)
     rowAggroCountCol:SetPoint("TOPLEFT", rowHpDeficitBorderCol, "BOTTOMLEFT", 0, -6)
     local lblAggroCount = rowAggroCountCol:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
     lblAggroCount:SetPoint("LEFT", rowAggroCountCol, "LEFT", 0, 0)
@@ -7392,12 +8275,15 @@ local function createConfigFrame()
       end)
     end)
     configFrame._elPartyAggroCountSwatchTex = texAggroCount
+    table.insert(configFrame._elConfigColorSwatchRows, rowHpDeficitTextCol)
+    table.insert(configFrame._elConfigColorSwatchRows, rowHpDeficitBorderCol)
+    table.insert(configFrame._elConfigColorSwatchRows, rowAggroCountCol)
 
     --- Helper: builds a "label + swatch button" row anchored below |anchorFrame|.
     --- |readRGB| returns current r,g,b; |writeRGB(r,g,b)| persists + re-applies. Returns the new row + swatch texture.
     local function makeColorRow(anchorFrame, yGap, label, tooltip, readRGB, writeRGB)
       local row = CreateFrame("Frame", nil, scrollChild4)
-      row:SetSize(innerW - 24, 22)
+      row:SetSize(innerW - 16, 22)
       row:SetPoint("TOPLEFT", anchorFrame, "BOTTOMLEFT", 0, -(yGap or 6))
       local lbl = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
       lbl:SetPoint("LEFT", row, "LEFT", 0, 0)
@@ -7423,6 +8309,9 @@ local function createConfigFrame()
           tex:SetVertexColor(r, g, b)
         end)
       end)
+      if configFrame._elConfigColorSwatchRows then
+        table.insert(configFrame._elConfigColorSwatchRows, row)
+      end
       return row, tex
     end
 
@@ -7469,20 +8358,17 @@ local function createConfigFrame()
     partySecLbl:SetText(L.CONFIG_COLORS_PARTY or "Party frame colors")
 
     --- Use class colors on party HP.
-    local classColorCheck = CreateFrame("CheckButton", nil, scrollChild4, "UICheckButtonTemplate")
-    classColorCheck:SetPoint("TOPLEFT", partySecLbl, "BOTTOMLEFT", -6, -4)
-    local classColorText = setCheckButtonLabel(classColorCheck, L.OPT_USE_CLASS_COLORS_PARTY or "Use class colors on party HP bars")
-    if classColorText then classColorText:SetTextColor(0.85, 0.87, 0.90) end
-    classColorCheck:SetScript("OnClick", function(self)
-      EnemyListDB.useClassColorsParty = self:GetChecked() and true or false
-      _EL.reapplyPartyBarColors()
-    end)
-    classColorCheck:SetScript("OnEnter", function(s)
-      GameTooltip:SetOwner(s, "ANCHOR_RIGHT")
-      GameTooltip:SetText(L.TOOLTIP_OPT_USE_CLASS_COLORS_PARTY or "Color party HP bars by class (standard raid-frame behavior). Uncheck to use the fallback color below for every unit.", nil, nil, nil, nil, true)
-      GameTooltip:Show()
-    end)
-    classColorCheck:SetScript("OnLeave", GameTooltip_Hide)
+    local classColorCheck = Wb.CreateBooleanOption(scrollChild4, {
+      placeAfter = partySecLbl,
+      offsetY = -4,
+      text = L.OPT_USE_CLASS_COLORS_PARTY,
+      textColor = { 0.85, 0.87, 0.90 },
+      onClick = function(self)
+        EnemyListDB.useClassColorsParty = self:GetChecked() and true or false
+        _EL.reapplyPartyBarColors()
+      end,
+      tooltip = L.TOOLTIP_OPT_USE_CLASS_COLORS_PARTY,
+    })
     configFrame._elUseClassColorsPartyCheck = classColorCheck
 
     local partyHpFallbackRow, partyHpFallbackTex = makeColorRow(
@@ -7508,20 +8394,17 @@ local function createConfigFrame()
     --- Power-type color toggle + mana bar color. The "Show mana bar" checkbox and "Mana bar
     --- height" slider used to live here; they now belong on the Party / Raid tabs (next to the
     --- other per-profile frame settings) since they control display, not color.
-    local powerTypeCheck = CreateFrame("CheckButton", nil, scrollChild4, "UICheckButtonTemplate")
-    powerTypeCheck:SetPoint("TOPLEFT", partyHpOORRow, "BOTTOMLEFT", -6, -8)
-    local powerTypeText = setCheckButtonLabel(powerTypeCheck, L.OPT_USE_POWERTYPE_COLORS or "Use power-type colors (mana/rage/energy/focus)")
-    if powerTypeText then powerTypeText:SetTextColor(0.85, 0.87, 0.90) end
-    powerTypeCheck:SetScript("OnClick", function(self)
-      EnemyListDB.usePowerTypeColorsParty = self:GetChecked() and true or false
-      _EL.reapplyPartyBarColors()
-    end)
-    powerTypeCheck:SetScript("OnEnter", function(s)
-      GameTooltip:SetOwner(s, "ANCHOR_RIGHT")
-      GameTooltip:SetText(L.TOOLTIP_OPT_USE_POWERTYPE_COLORS or "Color each unit's power bar by its current power type (mana blue, rage red, energy yellow, focus orange). Uncheck to always use the color below.", nil, nil, nil, nil, true)
-      GameTooltip:Show()
-    end)
-    powerTypeCheck:SetScript("OnLeave", GameTooltip_Hide)
+    local powerTypeCheck = Wb.CreateBooleanOption(scrollChild4, {
+      placeAfter = partyHpOORRow,
+      offsetY = -8,
+      text = L.OPT_USE_POWERTYPE_COLORS,
+      textColor = { 0.85, 0.87, 0.90 },
+      onClick = function(self)
+        EnemyListDB.usePowerTypeColorsParty = self:GetChecked() and true or false
+        _EL.reapplyPartyBarColors()
+      end,
+      tooltip = L.TOOLTIP_OPT_USE_POWERTYPE_COLORS,
+    })
     configFrame._elUsePowerTypeColorsCheck = powerTypeCheck
 
     local manaColorRow, manaColorTex = makeColorRow(
@@ -7660,9 +8543,11 @@ local function createConfigFrame()
 
   --- Profiles tab content (scrollChild5). Grid2-style auto-switch between party and raid settings.
   do
+    local Wb = EnemyList.ConfigWidgets
     local profilesTopMark = CreateFrame("Frame", nil, scrollChild5)
     profilesTopMark:SetSize(innerW, 1)
     profilesTopMark:SetPoint("TOPLEFT", scrollChild5, "TOPLEFT", 0, 0)
+    configFrame._elProfilesTopMark = profilesTopMark
 
     local profTitle = scrollChild5:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
     profTitle:SetPoint("TOPLEFT", profilesTopMark, "TOPLEFT", 6, -6)
@@ -7676,6 +8561,7 @@ local function createConfigFrame()
     profDesc:SetWordWrap(true)
     profDesc:SetTextColor(0.62, 0.65, 0.69)
     profDesc:SetText(L.CONFIG_PROFILES_DESC or "Two saved snapshots: one for Party and one for Raid. When auto-switch is on, entering a raid loads the Raid profile; leaving returns to Party. Settings on other tabs apply to whichever profile is currently active.")
+    configFrame._elProfDesc = profDesc
 
     local activeLbl = scrollChild5:CreateFontString(nil, "OVERLAY", "GameFontNormal")
     activeLbl:SetPoint("TOPLEFT", profDesc, "BOTTOMLEFT", 0, -10)
@@ -7687,23 +8573,23 @@ local function createConfigFrame()
     groupStateLbl:SetTextColor(0.62, 0.65, 0.69)
     configFrame._elGroupStateLbl = groupStateLbl
 
-    local autoCheck = CreateFrame("CheckButton", nil, scrollChild5, "UICheckButtonTemplate")
-    autoCheck:SetPoint("TOPLEFT", groupStateLbl, "BOTTOMLEFT", -6, -8)
-    local autoText = setCheckButtonLabel(autoCheck, L.OPT_AUTO_SWITCH_PROFILE or "Auto-switch profile by group size")
-    if autoText then autoText:SetTextColor(0.85, 0.87, 0.90) end
-    autoCheck:SetScript("OnClick", function(self)
-      EnemyListDB.autoSwitchProfile = self:GetChecked() and true or false
-      if EnemyListDB.autoSwitchProfile then
-        elSafe("profile_toggle_auto", enemyListApplyGroupProfileSwitch)
-      end
-      if configFrame._elProfilesRefresh then configFrame._elProfilesRefresh() end
-    end)
-    autoCheck:SetScript("OnEnter", function(self)
-      GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
-      GameTooltip:SetText(L.TOOLTIP_OPT_AUTO_SWITCH_PROFILE or "When checked, EnemyList loads the Raid profile when you are in a raid group and the Party profile otherwise. Uncheck to stay on the currently active profile regardless of group size.", nil, nil, nil, nil, true)
-      GameTooltip:Show()
-    end)
-    autoCheck:SetScript("OnLeave", GameTooltip_Hide)
+    local autoCheck = Wb.CreateBooleanOption(scrollChild5, {
+      point = "TOPLEFT",
+      ref = groupStateLbl,
+      relPoint = "BOTTOMLEFT",
+      x = -6,
+      y = -8,
+      text = L.OPT_AUTO_SWITCH_PROFILE,
+      textColor = { 0.85, 0.87, 0.90 },
+      onClick = function(self)
+        EnemyListDB.autoSwitchProfile = self:GetChecked() and true or false
+        if EnemyListDB.autoSwitchProfile then
+          elSafe("profile_toggle_auto", enemyListApplyGroupProfileSwitch)
+        end
+        if configFrame._elProfilesRefresh then configFrame._elProfilesRefresh() end
+      end,
+      tooltip = L.TOOLTIP_OPT_AUTO_SWITCH_PROFILE,
+    })
     configFrame._elAutoSwitchProfileCheck = autoCheck
 
     --- Manual profile selector (radio-style buttons) so the user can force-load either profile.
@@ -7796,6 +8682,7 @@ local function createConfigFrame()
     savedHint:SetWordWrap(true)
     savedHint:SetTextColor(0.62, 0.65, 0.69)
     savedHint:SetText(L.CONFIG_PROFILES_SAVED_HINT or "'Party' and 'Raid' are reserved and auto-switch with your group. Custom profiles load on demand — if auto-switch is on, entering or leaving a raid will replace a custom load with Party/Raid. Disable auto-switch above to stay on a custom profile.")
+    configFrame._elSavedHint = savedHint
 
     --- Row: [EditBox "new name"]  [Save as…]
     local saveRow = CreateFrame("Frame", nil, scrollChild5)
@@ -7873,7 +8760,14 @@ local function createConfigFrame()
 
       --- Build/reuse rows.
       local rowH = 26
-      local rowW = innerW - 12
+      local wInner = (configFrame._elInnerW or innerW) or 300
+      if configFrame._elTabScrollChildren and configFrame._elTabScrollChildren[5] and configFrame._elTabScrollChildren[5].GetWidth then
+        local wx = configFrame._elTabScrollChildren[5]:GetWidth()
+        if wx and wx > 32 then
+          wInner = math.min(wInner, wx)
+        end
+      end
+      local rowW = math.max(100, wInner - 12)
       local anchor = saveRow
       local active = EnemyListDB.activeProfileName or "party"
       for i = 1, math.max(#names, #profileRows) do
@@ -8012,14 +8906,70 @@ local function createConfigFrame()
       autoCheck:SetChecked(EnemyListDB.autoSwitchProfile ~= false)
       refreshSavedProfiles()
     end
+
+    configFrame._elLayoutProfilesTab = function()
+      local base = (configFrame._elInnerW or innerW) or 300
+      local sc5 = configFrame._elTabScrollChildren and configFrame._elTabScrollChildren[5]
+      local inner = minInnerForScrollW(base, sc5)
+      if inner < 200 then
+        return
+      end
+      if profilesTopMark and profilesTopMark.SetWidth then
+        profilesTopMark:SetWidth(inner)
+      end
+      local gap = 8
+      --- |avail| = room for a row of two equal buttons: match scroll5 width, 6px typical inset from |saveRow| style.
+      local hPad = 6
+      local btnRowAvail = inner - 2 * hPad
+      if btnPartyLoad and btnRaidLoad and btnRowAvail > gap + 8 then
+        local half = math.max(1, math.floor((btnRowAvail - gap) / 2))
+        if 2 * half + gap > btnRowAvail then
+          half = math.max(1, math.floor((btnRowAvail - gap) / 2))
+        end
+        btnPartyLoad:SetSize(half, 26)
+        btnRaidLoad:SetSize(half, 26)
+        btnPartyLoad:ClearAllPoints()
+        btnRaidLoad:ClearAllPoints()
+        btnPartyLoad:SetPoint("TOPLEFT", autoCheck, "BOTTOMLEFT", 0, -8)
+        btnRaidLoad:SetPoint("LEFT", btnPartyLoad, "RIGHT", gap, 0)
+      end
+      if btnCopyPR and btnCopyRP and btnPartyLoad and btnRowAvail and btnRowAvail > gap + 8 then
+        local half2 = math.max(1, math.floor((btnRowAvail - gap) / 2))
+        if 2 * half2 + gap > btnRowAvail then
+          half2 = math.max(1, math.floor((btnRowAvail - gap) / 2))
+        end
+        btnCopyPR:SetSize(half2, 26)
+        btnCopyRP:SetSize(half2, 26)
+        btnCopyPR:ClearAllPoints()
+        btnCopyRP:ClearAllPoints()
+        btnCopyPR:SetPoint("TOPLEFT", btnPartyLoad, "BOTTOMLEFT", 0, -12)
+        btnCopyRP:SetPoint("LEFT", btnCopyPR, "RIGHT", gap, 0)
+      end
+      if saveRow and nameBox and btnSaveAs then
+        local sidePad = 6
+        local saveW = 130
+        saveRow:SetWidth(inner - 2 * sidePad)
+        nameBox:SetWidth(math.max(80, inner - 2 * sidePad - gap - saveW - gap))
+        nameBox:ClearAllPoints()
+        btnSaveAs:ClearAllPoints()
+        nameBox:SetPoint("LEFT", saveRow, "LEFT", 0, 0)
+        btnSaveAs:SetPoint("LEFT", nameBox, "RIGHT", gap, 0)
+        btnSaveAs:SetSize(saveW, 24)
+      end
+      refreshSavedProfiles()
+    end
+
     configFrame._elProfilesRefresh()
   end
 
   --- Raid tab content (scrollChild6). Raid-specific toggles + quick profile switcher.
   do
+    local Wb = EnemyList.ConfigWidgets
+
     local raidTopMark = CreateFrame("Frame", nil, scrollChild6)
     raidTopMark:SetSize(innerW, 1)
     raidTopMark:SetPoint("TOPLEFT", scrollChild6, "TOPLEFT", 0, 0)
+    configFrame._elRaidTopMark = raidTopMark
 
     local raidTitle = scrollChild6:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
     raidTitle:SetPoint("TOPLEFT", raidTopMark, "TOPLEFT", 6, -6)
@@ -8033,6 +8983,7 @@ local function createConfigFrame()
     raidDesc:SetWordWrap(true)
     raidDesc:SetTextColor(0.62, 0.65, 0.69)
     raidDesc:SetText(L.CONFIG_RAID_DESC or "Most per-frame settings (size, gap, HP bar, colors) come from whichever profile is active. The Raid profile auto-loads in raid groups — use the button below to jump there now and tweak raid-only values. The toggles on this tab apply regardless of profile.")
+    configFrame._elRaidDesc = raidDesc
 
     local raidActiveLbl = scrollChild6:CreateFontString(nil, "OVERLAY", "GameFontNormal")
     raidActiveLbl:SetPoint("TOPLEFT", raidDesc, "BOTTOMLEFT", 0, -10)
@@ -8063,30 +9014,30 @@ local function createConfigFrame()
       if configFrame._elRaidRefresh then configFrame._elRaidRefresh() end
       print("|cff66ccff" .. L.ADDON_NAME .. "|r " .. string.format(L.MSG_PROFILE_LOADED or "Loaded %s profile.", enemyListProfileLabel("raid")))
     end)
+    configFrame._elRaidLoadBtn = raidLoadBtn
 
-    local hideInRaidCheck = CreateFrame("CheckButton", nil, scrollChild6, "UICheckButtonTemplate")
-    hideInRaidCheck:SetPoint("TOPLEFT", raidLoadBtn, "BOTTOMLEFT", 0, -10)
-    local hideInRaidText = setCheckButtonLabel(hideInRaidCheck, L.OPT_HIDE_PARTY_IN_RAID or "Hide party frames while in a raid")
-    if hideInRaidText then hideInRaidText:SetTextColor(0.85, 0.87, 0.90) end
-    hideInRaidCheck:SetScript("OnClick", function(self)
-      EnemyListDB.hidePartyFramesInRaid = self:GetChecked() and true or false
-      if togglePartyFramesVisibility then togglePartyFramesVisibility() end
-    end)
-    hideInRaidCheck:SetScript("OnEnter", function(s)
-      GameTooltip:SetOwner(s, "ANCHOR_RIGHT")
-      GameTooltip:SetText(L.TOOLTIP_OPT_HIDE_PARTY_IN_RAID or "When checked, EnemyList's party mini-frames stay hidden while you're in a raid group (useful when the default raid frames already cover that role). They reappear automatically when you leave the raid.", nil, nil, nil, nil, true)
-      GameTooltip:Show()
-    end)
-    hideInRaidCheck:SetScript("OnLeave", GameTooltip_Hide)
+    local hideInRaidCheck = Wb.CreateBooleanOption(scrollChild6, {
+      placeAfter = raidLoadBtn,
+      offsetY = -10,
+      text = L.OPT_HIDE_PARTY_IN_RAID,
+      textColor = { 0.85, 0.87, 0.90 },
+      onClick = function(self)
+        EnemyListDB.hidePartyFramesInRaid = self:GetChecked() and true or false
+        if togglePartyFramesVisibility then togglePartyFramesVisibility() end
+      end,
+      tooltip = L.TOOLTIP_OPT_HIDE_PARTY_IN_RAID,
+    })
     configFrame._elHideInRaidCheck = hideInRaidCheck
 
     local raidNote = scrollChild6:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    raidNote:SetPoint("TOPLEFT", hideInRaidCheck, "BOTTOMLEFT", 24, -8)
-    raidNote:SetWidth(innerW - 40)
+    --- Same left edge and width as |raidDesc| / Party tab so the frame panel below matches Party.
+    raidNote:SetPoint("TOPLEFT", hideInRaidCheck, "BOTTOMLEFT", 0, -8)
+    raidNote:SetWidth(innerW - 12)
     raidNote:SetJustifyH("LEFT")
     raidNote:SetWordWrap(true)
     raidNote:SetTextColor(0.58, 0.61, 0.65)
     raidNote:SetText(L.CONFIG_RAID_NOTE or "Tip: Appearance, Party, and Colors all save to the currently-active profile. Switch profiles (Profiles tab or the button above) before tweaking raid-only looks.")
+    configFrame._elRaidNote = raidNote
 
     configFrame._elRaidRefresh = function()
       if type(EnemyListDB) ~= "table" then return end
@@ -8103,13 +9054,15 @@ local function createConfigFrame()
       title     = L.CONFIG_SECTION_RAID_PANEL or "Raid Frames (Raid profile)",
       desc      = L.CONFIG_RAID_PANEL_DESC or "Settings on this tab always save to the Raid profile. Live preview only runs when the Raid profile is active.",
       anchorTop = raidNote,
+      --- Same horizontal origin as Party tab (|scrollChild3|) — no X offset; rows use full |innerW|.
+      anchorPanelOffsetX = 0,
     })
 
-    --- Height: intro block (title + desc + active-lbl + load-btn + hide-check + note ≈ 200) plus
-    --- full party panel (title + desc + 10 controls ≈ 440) ≈ 680. Round up for padding.
-    --- Raid tab = raid header (title/desc/active label/hide-in-raid/note/load button ≈ 200) +
-    --- full party panel (~880) + padding. Bump when new controls land in buildPartyFramePanel.
-    scrollChild6:SetHeight(1540)
+    --- Vertical extent: the shared |buildPartyFramePanel| needs the same room as the Party tab
+    --- (|scrollChild3| = 1420) plus a tall raid-only header: title, wrapped desc, active profile,
+    --- load button, hide-in-raid, wrapped tip (~300–400 px). 1540 was too small and cut off
+    --- the bottom of the panel; keep slack when |buildPartyFramePanel| grows.
+    scrollChild6:SetHeight(2000)
   end
 
   --- Keybinds tab (scrollChild2): points users at Clique for click-casting.
@@ -8125,6 +9078,8 @@ local function createConfigFrame()
   cliqueBody:SetWordWrap(true)
   cliqueBody:SetTextColor(0.78, 0.80, 0.84)
   cliqueBody:SetText(L.CONFIG_KEYBINDS_BODY)
+  configFrame._elCliqueTopMark = cliqueTopMark
+  configFrame._elKeybindsBodyFs = cliqueBody
 
   configFrame._elFontSlider = fontSlider
   configFrame._elMaxAggroSlider = maxAggroSlider
@@ -8405,6 +9360,9 @@ login:SetScript("OnEvent", function(_, event)
   if type(EnemyList.RefreshNameplateThreatOverlays) == "function" then
     EnemyList.RefreshNameplateThreatOverlays(true)
   end
+  if type(EnemyList.RefreshNameplateListMirrors) == "function" then
+    EnemyList.RefreshNameplateListMirrors(true)
+  end
   print("|cff66ccff" .. L.ADDON_NAME .. "|r v" .. (EnemyList.version or "?") .. " " .. L.MSG_LOADED_PER_CHARACTER .. " " .. L.MSG_LOADED_CONFIG_HINT)
 end)
 
@@ -8658,6 +9616,9 @@ SlashCmdList["ENEMYLIST"] = function(msg)
     EnemyListDB.testMode = defaults.testMode
     EnemyListDB.extendNameplateRange = defaults.extendNameplateRange
     EnemyListDB.nameplateThreatOverlay = defaults.nameplateThreatOverlay
+    EnemyListDB.nameplateListMirror = defaults.nameplateListMirror
+    EnemyListDB.nameplateThreatSecondStyle = defaults.nameplateThreatSecondStyle
+    EnemyListDB.listShowSecondInAggroSection = defaults.listShowSecondInAggroSection
     EnemyListDB.showPartyFrames = defaults.showPartyFrames
     EnemyListDB.partyFramePoint = defaults.partyFramePoint
     EnemyListDB.partyFrameRelPoint = defaults.partyFrameRelPoint
@@ -8690,6 +9651,9 @@ SlashCmdList["ENEMYLIST"] = function(msg)
     end
     if type(EnemyList.RefreshNameplateThreatOverlays) == "function" then
       EnemyList.RefreshNameplateThreatOverlays(true)
+    end
+    if type(EnemyList.RefreshNameplateListMirrors) == "function" then
+      EnemyList.RefreshNameplateListMirrors(true)
     end
     main:ClearAllPoints()
     if EnemyListDB.x and EnemyListDB.y then

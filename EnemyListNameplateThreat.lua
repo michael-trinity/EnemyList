@@ -34,12 +34,15 @@ local function ensureOverlay(np)
     return f
   end
   f = CreateFrame("Frame", nil, np)
-  local lvl = 5
-  if np.GetFrameLevel then
-    lvl = np:GetFrameLevel() or 5
-  end
   f:SetFrameStrata("MEDIUM")
-  f:SetFrameLevel(lvl + 25)
+  local base = 5
+  if type(EnemyList.GetNameplateStackBase) == "function" then
+    pcall(function()
+      base = EnemyList.GetNameplateStackBase(np) or base
+    end)
+  end
+  --- Above |EnemyListNameplateMirror| (|base+40|) and the stock plate.
+  f:SetFrameLevel(base + 70)
   f:SetAllPoints()
   f:EnableMouse(false)
   local edges = {}
@@ -84,6 +87,12 @@ end
 local function colorForThreat(ti)
   if not ti or not ti.hasAPI then
     return 0.42, 0.44, 0.48, 0.55, false
+  end
+  do
+    local db = getDb()
+    if type(db) == "table" and db.nameplateThreatSecondStyle and ti.isSecondOnThreat and not ti.isTanking then
+      return 0.12, 0.85, 0.95, 0.9, false
+    end
   end
   if ti.isTanking then
     local raw = ti.rawThreatPct
@@ -143,6 +152,11 @@ local function updateOne(unit)
     return
   end
   local ov = ensureOverlay(np)
+  if type(EnemyList.GetNameplateStackBase) == "function" then
+    pcall(function()
+      ov:SetFrameLevel(EnemyList.GetNameplateStackBase(np) + 70)
+    end)
+  end
   local r, g, b, a, pulse = colorForThreat(ti)
   ov:Show()
   setEdgeVisual(ov, r, g, b, a, pulse)

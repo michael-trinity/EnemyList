@@ -1,7 +1,7 @@
 local addonName, EnemyList = ...
 local L = EnemyList.L
 
-EnemyList.version = "1.8.96"
+EnemyList.version = "1.8.122"
 
 local playerGUID
 
@@ -706,8 +706,118 @@ local function getThreatAnalysis(unit)
   }
 end
 
+--- Cached: full-group sort by |UnitDetailedThreatSituation| pct (rank, 2nd holder, …).
+local threatRosterCache = {}
+local THREAT_ROSTER_TTL = 0.12
+
+--- Sorted list: index 1 = highest threat, 2 = 2nd on threat, etc.
+local function getCachedSortedThreatRoster(unit)
+  if not unit or not UnitExists(unit) or type(UnitDetailedThreatSituation) ~= "function" then
+    return nil
+  end
+  local guid = UnitGUID(unit)
+  if not guid then
+    return nil
+  end
+  local now = GetTime()
+  local cached = threatRosterCache[guid]
+  if cached and (now - cached.t) < THREAT_ROSTER_TTL then
+    return cached.list
+  end
+  local members = { "player" }
+  local inRaid, inParty = false, false
+  pcall(function()
+    inRaid = IsInRaid and IsInRaid()
+  end)
+  pcall(function()
+    inParty = IsInGroup and IsInGroup()
+  end)
+  if inRaid then
+    for i = 1, 40 do
+      members[#members + 1] = "raid" .. i
+    end
+  elseif inParty then
+    for i = 1, 4 do
+      members[#members + 1] = "party" .. i
+    end
+  end
+  local tmp = {}
+  for _, m in ipairs(members) do
+    if UnitExists(m) then
+      local connected = true
+      if type(UnitIsConnected) == "function" then
+        pcall(function()
+          connected = UnitIsConnected(m) ~= false
+        end)
+      end
+      if connected then
+        local ok, isTanking, status, pct = pcall(UnitDetailedThreatSituation, m, unit)
+        if ok and type(pct) == "number" and pct > 0 then
+          tmp[#tmp + 1] = { unit = m, pct = pct, isTanking = isTanking and true or false }
+        elseif ok and isTanking then
+          tmp[#tmp + 1] = { unit = m, pct = 100, isTanking = true }
+        end
+      end
+    end
+  end
+  if #tmp > 0 then
+    table.sort(tmp, function(a, b)
+      return a.pct > b.pct
+    end)
+  end
+  threatRosterCache[guid] = { t = now, list = tmp }
+  return tmp
+end
+
+local function getPlayerThreatListRankInfo(unit)
+  local tmp = getCachedSortedThreatRoster(unit)
+  if not tmp or #tmp == 0 then
+    return nil, 0
+  end
+  local n = #tmp
+  for i, e in ipairs(tmp) do
+    if e.unit and UnitIsUnit(e.unit, "player") then
+      return i, n
+    end
+  end
+  return nil, n
+end
+
+--- Public: who is 2nd on the mob’s full threat list (for a bar under the player’s threat bar).
+function EnemyList.GetSecondOnThreatInfo(unit)
+  local tmp = getCachedSortedThreatRoster(unit)
+  if not tmp or #tmp < 2 then
+    return nil
+  end
+  local e = tmp[2]
+  if not e or not e.unit then
+    return nil
+  end
+  local n = "?"
+  pcall(function()
+    n = UnitName(e.unit) or "?"
+  end)
+  return {
+    name = n,
+    pct = type(e.pct) == "number" and e.pct or 0,
+    isTanking = e.isTanking and true or false,
+  }
+end
+
+local function enrichThreatAnalysis(t, unit)
+  if type(t) ~= "table" or not unit or not UnitExists(unit) then
+    return
+  end
+  local r, n = getPlayerThreatListRankInfo(unit)
+  t.threatListRank = r
+  t.threatListMemberCount = n
+  t.isSecondOnThreat = (r == 2) and t.isTanking ~= true
+end
+
 function EnemyList.GetThreatAnalysis(unit)
-  return getThreatAnalysis(unit)
+  local tr = getThreatAnalysis(unit)
+  enrichThreatAnalysis(tr, unit)
+  return tr
 end
 
 local function isAggroSectionRow(t, data)
@@ -716,6 +826,12 @@ local function isAggroSectionRow(t, data)
   end
   if not t then
     return false
+  end
+  do
+    local db = rawget(_G, "EnemyListDB")
+    if type(db) == "table" and db.listShowSecondInAggroSection == true and t.isSecondOnThreat then
+      return true
+    end
   end
   if t.targetingPlayer or t.isTanking then
     return true
@@ -873,6 +989,7 @@ local function buildPreviewEnemyRows()
       castEnd = castEnd,
       raidMarker = fakeRaidMarkers[((idx or 1) - 1) % #fakeRaidMarkers + 1],
       runnerUpThreats = ti.runnerUps,
+      secondOnThreat = ti.secondOnDemo,
     }
   end
   --- Aggro entries: these mobs ARE targeting the player.
@@ -884,12 +1001,13 @@ local function buildPreviewEnemyRows()
     status = 3,
     hasAPI = true,
     targetingPlayer = true,
+    secondOnDemo = { name = "FuryWar", pct = 88 },
     runnerUps = {
+      { name = "Tank",        pct = 100, isTanking = true },
       { name = "DPS Alpha",   pct = 85 },
       { name = "DPS Bravo",   pct = 62 },
       { name = "Healer",      pct = 41 },
       { name = "DPS Charlie", pct = 18 },
-      { name = "DPS Delta",   pct = 5  },
     },
   }
   local tiBrute = {
@@ -900,6 +1018,7 @@ local function buildPreviewEnemyRows()
     status = 1,
     hasAPI = true,
     targetingPlayer = true,
+    secondOnDemo = { name = "ProtPal", pct = 94 },
     runnerUps = {
       { name = "Tank",      pct = 94 },
       { name = "DPS Alpha", pct = 55 },
@@ -1051,7 +1170,7 @@ local function getEnemyRowsImpl()
       local unit = EnemyList.ResolveUnitToken(guid)
       if unit and UnitExists(unit) and not UnitIsDead(unit) and UnitCanAttack("player", unit) then
         local dist = unitDistanceYards(unit)
-        local ta = getThreatAnalysis(unit)
+        local ta = EnemyList.GetThreatAnalysis(unit)
         local hp = UnitHealth(unit) or 0
         local hpMax = UnitHealthMax(unit) or 1
         --- Feature: aggro swap detection
@@ -1085,6 +1204,13 @@ local function getEnemyRowsImpl()
         --- Feature: creature type
         local creatureType = nil
         pcall(function() creatureType = UnitCreatureType(unit) end)
+        local secondT = nil
+        if type(EnemyList.GetSecondOnThreatInfo) == "function" then
+          local ok2, st = pcall(EnemyList.GetSecondOnThreatInfo, unit)
+          if ok2 and type(st) == "table" then
+            secondT = st
+          end
+        end
         local row = {
           guid = guid,
           name = data.name or (UnitName(unit) or "?"),
@@ -1095,6 +1221,7 @@ local function getEnemyRowsImpl()
           targetName = curTarget,
           aggro = ta.aggroText,
           threatInfo = ta,
+          secondOnThreat = secondT,
           health = hp,
           healthMax = hpMax,
           aggroSwapped = aggroSwapped,
@@ -1218,6 +1345,35 @@ function EnemyList.ApplyNameplateRangePreference()
   if cur < target then
     pcall(SetCVar, "nameplateMaxDistance", target)
   end
+end
+
+--- |C_NamePlate| child frames share one parent. Blizzard/Plater |UnitFrame| is usually a **higher** |FrameLevel| than
+--- the nameplate root, so add-on UI on the root at |nameplate+12| can still draw **behind** the stock plate.
+function EnemyList.GetNameplateStackBase(np)
+  if not np then
+    return 5
+  end
+  local a, b = 0, 0
+  pcall(function()
+    if np.GetFrameLevel then
+      a = np:GetFrameLevel() or 0
+    end
+  end)
+  for _, uf in pairs({ np.UnitFrame, np.unitFrame }) do
+    if type(uf) == "table" and uf.GetFrameLevel then
+      pcall(function()
+        local l = uf:GetFrameLevel() or 0
+        if l > b then
+          b = l
+        end
+      end)
+    end
+  end
+  local m = a > b and a or b
+  if m < 1 then
+    m = 5
+  end
+  return m
 end
 
 --- Many events (CLEU, threat, plates, …) used to each trigger a full |layoutRows| rebuild. Grid2-style: coalesce to a capped rate so we do one cheap “data pull” pass instead of dozens per second with many enemies.

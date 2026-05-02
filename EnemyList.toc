@@ -2,7 +2,7 @@
 ## Title: EnemyList
 ## Notes: List enemies in combat with you: distance, target, aggro. For click-casting on list rows or party frames, use Clique (or similar).
 ## Author: EnemyList
-## Version: 1.8.96
+## Version: 1.8.122
 ## SavedVariables: EnemyListAccountDB
 ## SavedVariablesPerCharacter: EnemyListDB
 
@@ -11,6 +11,8 @@ Locales\enUS.lua
 Locales\init.lua
 EnemyListCore.lua
 EnemyListNameplateThreat.lua
+EnemyListConfigWidgets.lua
 EnemyListUI.lua
+EnemyListNameplateMirror.lua
 EnemyListMinimap.lua
 EnemyListSetupWizard.lua
